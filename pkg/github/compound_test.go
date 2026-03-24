@@ -1578,3 +1578,391 @@ func Test_SquashMergeAndCleanup(t *testing.T) {
 		assert.Contains(t, errorContent.Text, "CI")
 	})
 }
+
+func Test_MergePRStack(t *testing.T) {
+	serverTool := MergePRStack(translations.NullTranslationHelper)
+	tool := serverTool.Tool
+	require.NoError(t, toolsnaps.Test(tool.Name, tool))
+
+	assert.Equal(t, "merge_pr_stack", tool.Name)
+	assert.NotEmpty(t, tool.Description)
+	schema := tool.InputSchema.(*jsonschema.Schema)
+	assert.Contains(t, schema.Properties, "owner")
+	assert.Contains(t, schema.Properties, "repo")
+	assert.Contains(t, schema.Properties, "pullNumbers")
+	assert.Contains(t, schema.Properties, "deleteRemoteBranches")
+	assert.ElementsMatch(t, schema.Required, []string{"owner", "repo", "pullNumbers"})
+
+	t.Run("happy path merges 3 PRs in order", func(t *testing.T) {
+		callCount := map[string]int{}
+
+		mockedClient := MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+			// GET PR details - returns open PRs
+			GetReposPullsByOwnerByRepoByPullNumber: func(w http.ResponseWriter, r *http.Request) {
+				callCount["get_pr"]++
+				pr := &github.PullRequest{
+					Number: github.Ptr(1),
+					State:  github.Ptr("open"),
+					Title:  github.Ptr("PR title"),
+					Body:   github.Ptr("PR body"),
+					Head: &github.PullRequestBranch{
+						SHA: github.Ptr("abc123"),
+						Ref: github.Ptr("feature-branch"),
+					},
+					Base: &github.PullRequestBranch{
+						Ref: github.Ptr("main"),
+					},
+				}
+				w.WriteHeader(http.StatusOK)
+				b, _ := json.Marshal(pr)
+				_, _ = w.Write(b)
+			},
+			// GET combined status - returns success
+			GetReposCommitsStatusByOwnerByRepoByRef: func(w http.ResponseWriter, _ *http.Request) {
+				callCount["get_status"]++
+				status := &github.CombinedStatus{
+					State: github.Ptr("success"),
+				}
+				w.WriteHeader(http.StatusOK)
+				b, _ := json.Marshal(status)
+				_, _ = w.Write(b)
+			},
+			// GET check runs - returns all passing
+			GetReposCommitsCheckRunsByOwnerByRepoByRef: func(w http.ResponseWriter, _ *http.Request) {
+				callCount["get_check_runs"]++
+				checkRuns := &github.ListCheckRunsResults{
+					Total:     github.Ptr(1),
+					CheckRuns: []*github.CheckRun{{Conclusion: github.Ptr("success")}},
+				}
+				w.WriteHeader(http.StatusOK)
+				b, _ := json.Marshal(checkRuns)
+				_, _ = w.Write(b)
+			},
+			// PUT merge - succeeds
+			PutReposPullsMergeByOwnerByRepoByPullNumber: func(w http.ResponseWriter, _ *http.Request) {
+				callCount["merge"]++
+				result := &github.PullRequestMergeResult{
+					Merged:  github.Ptr(true),
+					Message: github.Ptr("Pull Request successfully merged"),
+					SHA:     github.Ptr("merged-sha-" + string(rune('0'+callCount["merge"]))),
+				}
+				w.WriteHeader(http.StatusOK)
+				b, _ := json.Marshal(result)
+				_, _ = w.Write(b)
+			},
+			// PUT update branch - succeeds
+			PutReposPullsUpdateBranchByOwnerByRepoByPullNumber: func(w http.ResponseWriter, _ *http.Request) {
+				callCount["update_branch"]++
+				result := &github.PullRequestBranchUpdateResponse{
+					Message: github.Ptr("Updating pull request branch."),
+				}
+				w.WriteHeader(http.StatusAccepted)
+				b, _ := json.Marshal(result)
+				_, _ = w.Write(b)
+			},
+			// DELETE git ref - succeeds
+			"DELETE /repos/{owner}/{repo}/git/refs/{ref:.*}": func(w http.ResponseWriter, _ *http.Request) {
+				callCount["delete_ref"]++
+				w.WriteHeader(http.StatusNoContent)
+			},
+		})
+
+		client := github.NewClient(mockedClient)
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":                "owner",
+			"repo":                 "repo",
+			"pullNumbers":          []any{float64(1), float64(2), float64(3)},
+			"deleteRemoteBranches": true,
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+		require.False(t, result.IsError)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 3)
+		for _, r := range results {
+			assert.Equal(t, "merged", r.Status)
+			assert.NotEmpty(t, r.MergedSHA)
+			assert.Empty(t, r.Error)
+		}
+
+		assert.Equal(t, 3, callCount["get_pr"], "expected 3 PR fetches")
+		assert.Equal(t, 3, callCount["merge"], "expected 3 merges")
+		// update_branch called between merges: after PR 1 merged (for PR 2), after PR 2 merged (for PR 3)
+		assert.Equal(t, 2, callCount["update_branch"], "expected 2 branch updates")
+		assert.Equal(t, 3, callCount["delete_ref"], "expected 3 branch deletions")
+	})
+
+	t.Run("middle PR fails CI so first merged second fails third skipped", func(t *testing.T) {
+		prGetCount := 0
+
+		mockedClient := MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+			GetReposPullsByOwnerByRepoByPullNumber: func(w http.ResponseWriter, _ *http.Request) {
+				prGetCount++
+				pr := &github.PullRequest{
+					Number: github.Ptr(prGetCount),
+					State:  github.Ptr("open"),
+					Title:  github.Ptr("PR title"),
+					Body:   github.Ptr("PR body"),
+					Head: &github.PullRequestBranch{
+						SHA: github.Ptr("abc123"),
+						Ref: github.Ptr("feature-branch"),
+					},
+					Base: &github.PullRequestBranch{
+						Ref: github.Ptr("main"),
+					},
+				}
+				w.WriteHeader(http.StatusOK)
+				b, _ := json.Marshal(pr)
+				_, _ = w.Write(b)
+			},
+			GetReposCommitsStatusByOwnerByRepoByRef: func(w http.ResponseWriter, _ *http.Request) {
+				// First call: success (for PR 1), second call: failure (for PR 2)
+				status := &github.CombinedStatus{
+					State: github.Ptr("success"),
+				}
+				w.WriteHeader(http.StatusOK)
+				b, _ := json.Marshal(status)
+				_, _ = w.Write(b)
+			},
+			GetReposCommitsCheckRunsByOwnerByRepoByRef: func(w http.ResponseWriter, _ *http.Request) {
+				checkRuns := &github.ListCheckRunsResults{
+					Total:     github.Ptr(1),
+					CheckRuns: []*github.CheckRun{{Conclusion: github.Ptr("success")}},
+				}
+				w.WriteHeader(http.StatusOK)
+				b, _ := json.Marshal(checkRuns)
+				_, _ = w.Write(b)
+			},
+			PutReposPullsMergeByOwnerByRepoByPullNumber: func(w http.ResponseWriter, _ *http.Request) {
+				// First merge succeeds, second fails
+				result := &github.PullRequestMergeResult{
+					Merged:  github.Ptr(true),
+					Message: github.Ptr("Pull Request successfully merged"),
+					SHA:     github.Ptr("merged-sha"),
+				}
+				w.WriteHeader(http.StatusOK)
+				b, _ := json.Marshal(result)
+				_, _ = w.Write(b)
+			},
+			PutReposPullsUpdateBranchByOwnerByRepoByPullNumber: func(w http.ResponseWriter, _ *http.Request) {
+				result := &github.PullRequestBranchUpdateResponse{
+					Message: github.Ptr("Updating pull request branch."),
+				}
+				w.WriteHeader(http.StatusAccepted)
+				b, _ := json.Marshal(result)
+				_, _ = w.Write(b)
+			},
+			"DELETE /repos/{owner}/{repo}/git/refs/{ref:.*}": func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			},
+		})
+
+		// For this test, we need per-PR behavior. We'll use a simpler approach:
+		// Create a custom handler that tracks state and fails the merge for PR 2.
+		mergeCount := 0
+		mockedClient2 := MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+			GetReposPullsByOwnerByRepoByPullNumber: mockedClient.Transport.(*multiHandlerTransport).handlers[GetReposPullsByOwnerByRepoByPullNumber],
+			GetReposCommitsStatusByOwnerByRepoByRef: func(w http.ResponseWriter, _ *http.Request) {
+				status := &github.CombinedStatus{State: github.Ptr("success")}
+				w.WriteHeader(http.StatusOK)
+				b, _ := json.Marshal(status)
+				_, _ = w.Write(b)
+			},
+			GetReposCommitsCheckRunsByOwnerByRepoByRef: func(w http.ResponseWriter, _ *http.Request) {
+				checkRuns := &github.ListCheckRunsResults{
+					Total:     github.Ptr(1),
+					CheckRuns: []*github.CheckRun{{Conclusion: github.Ptr("success")}},
+				}
+				w.WriteHeader(http.StatusOK)
+				b, _ := json.Marshal(checkRuns)
+				_, _ = w.Write(b)
+			},
+			PutReposPullsMergeByOwnerByRepoByPullNumber: func(w http.ResponseWriter, _ *http.Request) {
+				mergeCount++
+				if mergeCount == 2 {
+					// Second merge (PR 2) fails
+					w.WriteHeader(http.StatusMethodNotAllowed)
+					_, _ = w.Write([]byte(`{"message": "Pull request is not mergeable"}`))
+					return
+				}
+				result := &github.PullRequestMergeResult{
+					Merged:  github.Ptr(true),
+					Message: github.Ptr("Pull Request successfully merged"),
+					SHA:     github.Ptr("merged-sha"),
+				}
+				w.WriteHeader(http.StatusOK)
+				b, _ := json.Marshal(result)
+				_, _ = w.Write(b)
+			},
+			PutReposPullsUpdateBranchByOwnerByRepoByPullNumber: func(w http.ResponseWriter, _ *http.Request) {
+				result := &github.PullRequestBranchUpdateResponse{
+					Message: github.Ptr("Updating pull request branch."),
+				}
+				w.WriteHeader(http.StatusAccepted)
+				b, _ := json.Marshal(result)
+				_, _ = w.Write(b)
+			},
+			"DELETE /repos/{owner}/{repo}/git/refs/{ref:.*}": func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			},
+		})
+
+		client := github.NewClient(mockedClient2)
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(1), float64(2), float64(3)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+		require.False(t, result.IsError)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 3)
+		assert.Equal(t, "merged", results[0].Status)
+		assert.Equal(t, "failed", results[1].Status)
+		assert.NotEmpty(t, results[1].Error)
+		assert.Equal(t, "skipped", results[2].Status)
+	})
+
+	t.Run("single PR in stack merges normally", func(t *testing.T) {
+		mockedClient := MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+			GetReposPullsByOwnerByRepoByPullNumber: mockResponse(t, http.StatusOK, &github.PullRequest{
+				Number: github.Ptr(42),
+				State:  github.Ptr("open"),
+				Title:  github.Ptr("Single PR"),
+				Body:   github.Ptr("body"),
+				Head: &github.PullRequestBranch{
+					SHA: github.Ptr("head-sha"),
+					Ref: github.Ptr("feature"),
+				},
+				Base: &github.PullRequestBranch{Ref: github.Ptr("main")},
+			}),
+			GetReposCommitsStatusByOwnerByRepoByRef: mockResponse(t, http.StatusOK, &github.CombinedStatus{
+				State: github.Ptr("success"),
+			}),
+			GetReposCommitsCheckRunsByOwnerByRepoByRef: mockResponse(t, http.StatusOK, &github.ListCheckRunsResults{
+				Total:     github.Ptr(0),
+				CheckRuns: []*github.CheckRun{},
+			}),
+			PutReposPullsMergeByOwnerByRepoByPullNumber: mockResponse(t, http.StatusOK, &github.PullRequestMergeResult{
+				Merged:  github.Ptr(true),
+				Message: github.Ptr("Merged"),
+				SHA:     github.Ptr("merged-sha-42"),
+			}),
+			"DELETE /repos/{owner}/{repo}/git/refs/{ref:.*}": func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			},
+		})
+
+		client := github.NewClient(mockedClient)
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(42)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+		require.False(t, result.IsError)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 1)
+		assert.Equal(t, "merged", results[0].Status)
+		assert.Equal(t, 42, results[0].PullNumber)
+		assert.Equal(t, "merged-sha-42", results[0].MergedSHA)
+	})
+
+	t.Run("empty pullNumbers array returns empty result", func(t *testing.T) {
+		mockedClient := MockHTTPClientWithHandlers(map[string]http.HandlerFunc{})
+		client := github.NewClient(mockedClient)
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+		require.False(t, result.IsError)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+		assert.Empty(t, results)
+	})
+
+	t.Run("PR not open fails that one and skips rest", func(t *testing.T) {
+		mockedClient := MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+			GetReposPullsByOwnerByRepoByPullNumber: mockResponse(t, http.StatusOK, &github.PullRequest{
+				Number: github.Ptr(10),
+				State:  github.Ptr("closed"),
+				Title:  github.Ptr("Closed PR"),
+				Body:   github.Ptr("body"),
+				Head: &github.PullRequestBranch{
+					SHA: github.Ptr("head-sha"),
+					Ref: github.Ptr("feature"),
+				},
+				Base: &github.PullRequestBranch{Ref: github.Ptr("main")},
+			}),
+		})
+
+		client := github.NewClient(mockedClient)
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(10), float64(11), float64(12)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+		require.False(t, result.IsError)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 3)
+		assert.Equal(t, "failed", results[0].Status)
+		assert.Contains(t, results[0].Error, "not open")
+		assert.Equal(t, "skipped", results[1].Status)
+		assert.Equal(t, "skipped", results[2].Status)
+	})
+}

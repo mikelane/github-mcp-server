@@ -123,6 +123,11 @@ var (
 		Description: "GitHub Stargazers related tools",
 		Icon:        "star",
 	}
+	ToolsetMetadataCompound = inventory.ToolsetMetadata{
+		ID:          "compound",
+		Description: "Compound tools that orchestrate multiple GitHub API calls",
+		Icon:        "workflow",
+	}
 	ToolsetMetadataDynamic = inventory.ToolsetMetadata{
 		ID:          "dynamic",
 		Description: "Discover GitHub MCP tools that can help achieve tasks by enabling additional sets of tools, you can control the enablement of any toolset to access its tools when this toolset is enabled.",
@@ -277,6 +282,7 @@ func AllTools(t translations.TranslationHelperFunc) []inventory.ServerTool {
 
 		// Compound tools
 		SquashMergeAndCleanup(t),
+		MergePRStack(t),
 	}
 }
 
