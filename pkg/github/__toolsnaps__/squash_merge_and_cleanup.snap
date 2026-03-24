@@ -1,0 +1,41 @@
+{
+  "annotations": {
+    "title": "Squash merge and cleanup"
+  },
+  "description": "Check CI status, squash merge a pull request, and delete the remote branch in one operation.",
+  "inputSchema": {
+    "properties": {
+      "commitMessage": {
+        "description": "Custom message for the squash merge commit. Defaults to the PR body.",
+        "type": "string"
+      },
+      "commitTitle": {
+        "description": "Custom title for the squash merge commit. Defaults to the PR title.",
+        "type": "string"
+      },
+      "deleteRemoteBranch": {
+        "description": "Whether to delete the remote branch after merging. Defaults to true.",
+        "type": "boolean"
+      },
+      "owner": {
+        "description": "Repository owner",
+        "type": "string"
+      },
+      "pullNumber": {
+        "description": "Pull request number",
+        "type": "number"
+      },
+      "repo": {
+        "description": "Repository name",
+        "type": "string"
+      }
+    },
+    "required": [
+      "owner",
+      "repo",
+      "pullNumber"
+    ],
+    "type": "object"
+  },
+  "name": "squash_merge_and_cleanup"
+}
