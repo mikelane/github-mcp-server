@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "==> pre-push: running checks..."
+
+echo "--- go build"
+go build ./...
+
+echo "--- go vet"
+go vet ./...
+
+echo "--- golangci-lint (new issues only)"
+if command -v golangci-lint &>/dev/null; then
+    golangci-lint run --new-from-rev=origin/main ./pkg/github/...
+else
+    echo "    golangci-lint not found, skipping (install: brew install golangci-lint)"
+fi
+
+echo "--- go test"
+go test ./pkg/github/... -count=1 -timeout 120s
+
+echo "==> pre-push: all checks passed"
