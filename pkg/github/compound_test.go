@@ -181,7 +181,203 @@ func Test_SquashMergeAndCleanup(t *testing.T) {
 
 		errorContent := getErrorResult(t, result)
 		assert.Contains(t, errorContent.Text, "Lint")
-		assert.Contains(t, errorContent.Text, "failing")
+		assert.Contains(t, errorContent.Text, "Failing")
+	})
+
+	t.Run("rejects merge when combined status is pending with actual statuses", func(t *testing.T) {
+		headSHA := "abc123def456"
+
+		mockedClient := MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+			GetReposPullsByOwnerByRepoByPullNumber: mockResponse(t, http.StatusOK, &github.PullRequest{
+				State: github.Ptr("open"),
+				Head: &github.PullRequestBranch{
+					SHA: github.Ptr(headSHA),
+					Ref: github.Ptr("feature-branch"),
+				},
+				Base: &github.PullRequestBranch{
+					Ref: github.Ptr("main"),
+				},
+			}),
+			GetReposCommitsStatusByOwnerByRepoByRef: mockResponse(t, http.StatusOK, &github.CombinedStatus{
+				State: github.Ptr("pending"),
+				Statuses: []*github.RepoStatus{
+					{
+						Context: github.Ptr("ci/build"),
+						State:   github.Ptr("pending"),
+					},
+				},
+			}),
+			GetReposCommitsCheckRunsByOwnerByRepoByRef: mockResponse(t, http.StatusOK, &github.ListCheckRunsResults{
+				Total:     github.Ptr(0),
+				CheckRuns: []*github.CheckRun{},
+			}),
+		})
+
+		client := github.NewClient(mockedClient)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":      "owner",
+			"repo":       "repo",
+			"pullNumber": float64(42),
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+		require.True(t, result.IsError)
+
+		errorContent := getErrorResult(t, result)
+		assert.Contains(t, errorContent.Text, "cannot merge")
+		assert.Contains(t, errorContent.Text, "ci/build")
+	})
+
+	t.Run("rejects merge when check runs are in progress", func(t *testing.T) {
+		headSHA := "abc123def456"
+
+		mockedClient := MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+			GetReposPullsByOwnerByRepoByPullNumber: mockResponse(t, http.StatusOK, &github.PullRequest{
+				State: github.Ptr("open"),
+				Head: &github.PullRequestBranch{
+					SHA: github.Ptr(headSHA),
+					Ref: github.Ptr("feature-branch"),
+				},
+				Base: &github.PullRequestBranch{
+					Ref: github.Ptr("main"),
+				},
+			}),
+			GetReposCommitsStatusByOwnerByRepoByRef: mockResponse(t, http.StatusOK, &github.CombinedStatus{
+				State: github.Ptr("pending"),
+			}),
+			GetReposCommitsCheckRunsByOwnerByRepoByRef: mockResponse(t, http.StatusOK, &github.ListCheckRunsResults{
+				Total: github.Ptr(1),
+				CheckRuns: []*github.CheckRun{
+					{
+						Name:   github.Ptr("CI"),
+						Status: github.Ptr("in_progress"),
+					},
+				},
+			}),
+		})
+
+		client := github.NewClient(mockedClient)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":      "owner",
+			"repo":       "repo",
+			"pullNumber": float64(42),
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+		require.True(t, result.IsError)
+
+		errorContent := getErrorResult(t, result)
+		assert.Contains(t, errorContent.Text, "cannot merge")
+		assert.Contains(t, errorContent.Text, "CI")
+	})
+
+	t.Run("merges when no CI is configured (pending with zero statuses and zero check runs)", func(t *testing.T) {
+		headSHA := "abc123def456"
+		mergedSHA := "merged789xyz"
+
+		mockedClient := MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+			GetReposPullsByOwnerByRepoByPullNumber: mockResponse(t, http.StatusOK, &github.PullRequest{
+				State: github.Ptr("open"),
+				Head: &github.PullRequestBranch{
+					SHA: github.Ptr(headSHA),
+					Ref: github.Ptr("feature-branch"),
+				},
+				Base: &github.PullRequestBranch{
+					Ref: github.Ptr("main"),
+				},
+				Title: github.Ptr("Add feature"),
+				Body:  github.Ptr("Feature description"),
+			}),
+			GetReposCommitsStatusByOwnerByRepoByRef: mockResponse(t, http.StatusOK, &github.CombinedStatus{
+				State:    github.Ptr("pending"),
+				Statuses: []*github.RepoStatus{},
+			}),
+			GetReposCommitsCheckRunsByOwnerByRepoByRef: mockResponse(t, http.StatusOK, &github.ListCheckRunsResults{
+				Total:     github.Ptr(0),
+				CheckRuns: []*github.CheckRun{},
+			}),
+			PutReposPullsMergeByOwnerByRepoByPullNumber: mockResponse(t, http.StatusOK, &github.PullRequestMergeResult{
+				Merged:  github.Ptr(true),
+				Message: github.Ptr("Pull Request successfully merged"),
+				SHA:     github.Ptr(mergedSHA),
+			}),
+			"DELETE /repos/{owner}/{repo}/git/refs/{ref:.*}": mockResponse(t, http.StatusNoContent, nil),
+		})
+
+		client := github.NewClient(mockedClient)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":      "owner",
+			"repo":       "repo",
+			"pullNumber": float64(42),
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+		require.False(t, result.IsError)
+
+		textContent := getTextResult(t, result)
+		var response map[string]any
+		err = json.Unmarshal([]byte(textContent.Text), &response)
+		require.NoError(t, err)
+		assert.Equal(t, mergedSHA, response["mergedSHA"])
+	})
+
+	t.Run("returns error on merge conflict (409) without attempting branch deletion", func(t *testing.T) {
+		headSHA := "abc123def456"
+
+		mockedClient := MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+			GetReposPullsByOwnerByRepoByPullNumber: mockResponse(t, http.StatusOK, &github.PullRequest{
+				State: github.Ptr("open"),
+				Head: &github.PullRequestBranch{
+					SHA: github.Ptr(headSHA),
+					Ref: github.Ptr("feature-branch"),
+				},
+				Base: &github.PullRequestBranch{
+					Ref: github.Ptr("main"),
+				},
+				Title: github.Ptr("Add feature"),
+				Body:  github.Ptr("Feature description"),
+			}),
+			GetReposCommitsStatusByOwnerByRepoByRef: mockResponse(t, http.StatusOK, &github.CombinedStatus{
+				State: github.Ptr("success"),
+			}),
+			GetReposCommitsCheckRunsByOwnerByRepoByRef: mockResponse(t, http.StatusOK, &github.ListCheckRunsResults{
+				Total:     github.Ptr(0),
+				CheckRuns: []*github.CheckRun{},
+			}),
+			PutReposPullsMergeByOwnerByRepoByPullNumber: mockResponse(t, http.StatusConflict, map[string]string{
+				"message": "Head branch was modified. Review and try the merge again.",
+			}),
+			// No DELETE handler — if branch deletion is attempted, it will 404 and fail the test
+		})
+
+		client := github.NewClient(mockedClient)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":      "owner",
+			"repo":       "repo",
+			"pullNumber": float64(42),
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+		require.True(t, result.IsError)
+
+		errorContent := getErrorResult(t, result)
+		assert.Contains(t, errorContent.Text, "failed to merge")
 	})
 
 	t.Run("uses custom commit title and message", func(t *testing.T) {

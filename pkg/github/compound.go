@@ -98,13 +98,10 @@ func SquashMergeAndCleanup(t translations.TranslationHelperFunc) inventory.Serve
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
 			deleteRemoteBranch := true
-			if v, vErr := OptionalParam[bool](args, "deleteRemoteBranch"); vErr != nil {
-				return utils.NewToolResultError(vErr.Error()), nil, nil
-			} else if v == false {
-				// Check if the parameter was explicitly provided as false
-				if _, ok := args["deleteRemoteBranch"]; ok {
-					deleteRemoteBranch = false
-				}
+			if v, ok, err := OptionalParamOK[bool](args, "deleteRemoteBranch"); err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			} else if ok {
+				deleteRemoteBranch = v
 			}
 
 			client, err := deps.GetClient(ctx)
@@ -141,32 +138,51 @@ func SquashMergeAndCleanup(t translations.TranslationHelperFunc) inventory.Serve
 			}
 			defer func() { _ = resp.Body.Close() }()
 
-			// Step 4: If any checks are failing, return error with details
-			if combinedStatus.GetState() == "failure" || combinedStatus.GetState() == "error" {
+			// Step 4: Verify all checks pass using an allow-list approach.
+			// Combined status must be "success", or "pending" only when no CI is configured.
+			combinedState := combinedStatus.GetState()
+			if combinedState == "success" {
+				// Combined status is green — continue
+			} else if combinedState == "pending" && len(combinedStatus.Statuses) == 0 && len(checkRuns.CheckRuns) == 0 {
+				// No CI configured at all — safe to merge
+			} else {
+				// Any other state (pending with actual checks, failure, error) — reject
 				var failingChecks []string
+				for _, s := range combinedStatus.Statuses {
+					if s.GetState() != "success" {
+						failingChecks = append(failingChecks, fmt.Sprintf("%s (%s)", s.GetContext(), s.GetState()))
+					}
+				}
 				for _, cr := range checkRuns.CheckRuns {
-					conclusion := cr.GetConclusion()
-					if conclusion == "failure" || conclusion == "error" || conclusion == "cancelled" {
-						failingChecks = append(failingChecks, cr.GetName())
+					if cr.GetStatus() != "completed" || (cr.GetConclusion() != "success" && cr.GetConclusion() != "neutral" && cr.GetConclusion() != "skipped") {
+						status := cr.GetStatus()
+						if status == "completed" {
+							status = cr.GetConclusion()
+						}
+						failingChecks = append(failingChecks, fmt.Sprintf("%s (%s)", cr.GetName(), status))
 					}
 				}
 				return utils.NewToolResultError(fmt.Sprintf(
-					"cannot merge: checks are failing. Failed checks: %s",
-					strings.Join(failingChecks, ", "),
+					"cannot merge: checks are not passing (combined status: %s). Failing checks: %s",
+					combinedState, strings.Join(failingChecks, ", "),
 				)), nil, nil
 			}
 
-			// Also check individual check runs for failures even if combined status is not "failure"
+			// Verify each individual check run has completed successfully
 			var failingCheckRuns []string
 			for _, cr := range checkRuns.CheckRuns {
-				conclusion := cr.GetConclusion()
-				if conclusion == "failure" || conclusion == "error" {
-					failingCheckRuns = append(failingCheckRuns, cr.GetName())
+				if cr.GetStatus() != "completed" {
+					failingCheckRuns = append(failingCheckRuns, fmt.Sprintf("%s (status: %s)", cr.GetName(), cr.GetStatus()))
+				} else {
+					conclusion := cr.GetConclusion()
+					if conclusion != "success" && conclusion != "neutral" && conclusion != "skipped" {
+						failingCheckRuns = append(failingCheckRuns, fmt.Sprintf("%s (conclusion: %s)", cr.GetName(), conclusion))
+					}
 				}
 			}
 			if len(failingCheckRuns) > 0 {
 				return utils.NewToolResultError(fmt.Sprintf(
-					"cannot merge: checks are failing. Failed checks: %s",
+					"cannot merge: check runs are not passing. Failing checks: %s",
 					strings.Join(failingCheckRuns, ", "),
 				)), nil, nil
 			}
@@ -198,6 +214,9 @@ func SquashMergeAndCleanup(t translations.TranslationHelperFunc) inventory.Serve
 			if deleteRemoteBranch {
 				ref := fmt.Sprintf("heads/%s", branchName)
 				resp, err := client.Git.DeleteRef(ctx, owner, repo, ref)
+				if resp != nil && resp.Body != nil {
+					defer func() { _ = resp.Body.Close() }()
+				}
 				if err != nil {
 					// 422 means the branch was already deleted — treat as success
 					if resp != nil && resp.StatusCode == http.StatusUnprocessableEntity {
@@ -207,7 +226,6 @@ func SquashMergeAndCleanup(t translations.TranslationHelperFunc) inventory.Serve
 					}
 				} else {
 					branchDeleted = true
-					defer func() { _ = resp.Body.Close() }()
 				}
 			}
 
