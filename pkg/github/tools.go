@@ -274,6 +274,9 @@ func AllTools(t translations.TranslationHelperFunc) []inventory.ServerTool {
 		GetLabelForLabelsToolset(t),
 		ListLabels(t),
 		LabelWrite(t),
+
+		// Compound tools
+		SquashMergeAndCleanup(t),
 	}
 }
 
