@@ -135,31 +135,28 @@ func SquashMergeAndCleanup(t translations.TranslationHelperFunc) inventory.Serve
 			// Step 4: Verify all checks pass using an allow-list approach.
 			// Combined status must be "success", or "pending" only when no CI is configured.
 			combinedState := combinedStatus.GetState()
-			if combinedState == "success" {
-				// Combined status is green — continue
-			} else if combinedState == "pending" && len(combinedStatus.Statuses) == 0 && len(checkRuns.CheckRuns) == 0 {
-				// No CI configured at all — safe to merge
-			} else {
-				// Any other state (pending with actual checks, failure, error) — reject
-				var failingChecks []string
-				for _, s := range combinedStatus.Statuses {
-					if s.GetState() != "success" {
-						failingChecks = append(failingChecks, fmt.Sprintf("%s (%s)", s.GetContext(), s.GetState()))
-					}
-				}
-				for _, cr := range checkRuns.CheckRuns {
-					if cr.GetStatus() != "completed" || (cr.GetConclusion() != "success" && cr.GetConclusion() != "neutral" && cr.GetConclusion() != "skipped") {
-						status := cr.GetStatus()
-						if status == "completed" {
-							status = cr.GetConclusion()
+			if combinedState != "success" {
+				if combinedState != "pending" || len(combinedStatus.Statuses) != 0 || len(checkRuns.CheckRuns) != 0 {
+					var failingChecks []string
+					for _, s := range combinedStatus.Statuses {
+						if s.GetState() != "success" {
+							failingChecks = append(failingChecks, fmt.Sprintf("%s (%s)", s.GetContext(), s.GetState()))
 						}
-						failingChecks = append(failingChecks, fmt.Sprintf("%s (%s)", cr.GetName(), status))
 					}
+					for _, cr := range checkRuns.CheckRuns {
+						if cr.GetStatus() != "completed" || (cr.GetConclusion() != "success" && cr.GetConclusion() != "neutral" && cr.GetConclusion() != "skipped") {
+							status := cr.GetStatus()
+							if status == "completed" {
+								status = cr.GetConclusion()
+							}
+							failingChecks = append(failingChecks, fmt.Sprintf("%s (%s)", cr.GetName(), status))
+						}
+					}
+					return utils.NewToolResultError(fmt.Sprintf(
+						"cannot merge: checks are not passing (combined status: %s). Failing checks: %s",
+						combinedState, strings.Join(failingChecks, ", "),
+					)), nil, nil
 				}
-				return utils.NewToolResultError(fmt.Sprintf(
-					"cannot merge: checks are not passing (combined status: %s). Failing checks: %s",
-					combinedState, strings.Join(failingChecks, ", "),
-				)), nil, nil
 			}
 
 			// Verify each individual check run has completed successfully
@@ -424,18 +421,27 @@ func checksPass(ctx context.Context, client *github.Client, owner, repo, ref str
 		return false
 	}
 
-	if combinedStatus.GetState() == "failure" || combinedStatus.GetState() == "error" {
-		return false
-	}
-
 	checkRuns, _, err := client.Checks.ListCheckRunsForRef(ctx, owner, repo, ref, nil)
 	if err != nil {
 		return false
 	}
 
+	// Allow-list approach: combined status must be "success", or "pending" only
+	// when no CI is configured (zero statuses and zero check runs).
+	combinedState := combinedStatus.GetState()
+	if combinedState != "success" {
+		if combinedState != "pending" || len(combinedStatus.Statuses) != 0 || len(checkRuns.CheckRuns) != 0 {
+			return false
+		}
+	}
+
+	// Each check run must be completed with an acceptable conclusion.
 	for _, cr := range checkRuns.CheckRuns {
+		if cr.GetStatus() != "completed" {
+			return false
+		}
 		conclusion := cr.GetConclusion()
-		if conclusion == "failure" || conclusion == "cancelled" || conclusion == "timed_out" || conclusion == "action_required" {
+		if conclusion != "success" && conclusion != "neutral" && conclusion != "skipped" {
 			return false
 		}
 	}

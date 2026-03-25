@@ -1611,8 +1611,11 @@ func passingStatusResponse(t *testing.T) http.HandlerFunc {
 func passingCheckRunsResponse(t *testing.T) http.HandlerFunc {
 	t.Helper()
 	return mockResponse(t, http.StatusOK, &github.ListCheckRunsResults{
-		Total:     github.Ptr(1),
-		CheckRuns: []*github.CheckRun{{Conclusion: github.Ptr("success")}},
+		Total: github.Ptr(1),
+		CheckRuns: []*github.CheckRun{{
+			Status:     github.Ptr("completed"),
+			Conclusion: github.Ptr("success"),
+		}},
 	})
 }
 
@@ -2302,9 +2305,9 @@ func Test_MergePRStack(t *testing.T) {
 		handlers[GetReposCommitsCheckRunsByOwnerByRepoByRef] = mockResponse(t, http.StatusOK, &github.ListCheckRunsResults{
 			Total: github.Ptr(3),
 			CheckRuns: []*github.CheckRun{
-				{Conclusion: github.Ptr("neutral")},
-				{Conclusion: github.Ptr("skipped")},
-				{Conclusion: github.Ptr("success")},
+				{Status: github.Ptr("completed"), Conclusion: github.Ptr("neutral")},
+				{Status: github.Ptr("completed"), Conclusion: github.Ptr("skipped")},
+				{Status: github.Ptr("completed"), Conclusion: github.Ptr("success")},
 			},
 		})
 
@@ -2526,7 +2529,7 @@ func Test_MergePRStack(t *testing.T) {
 
 	// --- Combined status pending passes (not failure/error) ---
 
-	t.Run("combined status pending with passing check runs passes", func(t *testing.T) {
+	t.Run("combined status pending with check runs rejects merge", func(t *testing.T) {
 		handlers := happyPathHandlers(t)
 		handlers[GetReposCommitsStatusByOwnerByRepoByRef] = mockResponse(t, http.StatusOK, &github.CombinedStatus{
 			State: github.Ptr("pending"),
@@ -2552,13 +2555,153 @@ func Test_MergePRStack(t *testing.T) {
 		require.NoError(t, err)
 
 		require.Len(t, results, 1)
-		assert.Equal(t, "merged", results[0].Status)
+		assert.Equal(t, "failed", results[0].Status)
+		assert.Contains(t, results[0].Error, "failing checks")
 	})
 
 	// --- No check runs at all passes ---
 
 	t.Run("no check runs with success status passes", func(t *testing.T) {
 		handlers := happyPathHandlers(t)
+		handlers[GetReposCommitsCheckRunsByOwnerByRepoByRef] = mockResponse(t, http.StatusOK, &github.ListCheckRunsResults{
+			Total:     github.Ptr(0),
+			CheckRuns: []*github.CheckRun{},
+		})
+
+		client := github.NewClient(MockHTTPClientWithHandlers(handlers))
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(1)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 1)
+		assert.Equal(t, "merged", results[0].Status)
+	})
+
+	// --- Allow-list CI gate: in_progress check run (the critical bug) ---
+
+	t.Run("check run with in_progress status and no conclusion rejects merge", func(t *testing.T) {
+		handlers := happyPathHandlers(t)
+		handlers[GetReposCommitsCheckRunsByOwnerByRepoByRef] = mockResponse(t, http.StatusOK, &github.ListCheckRunsResults{
+			Total: github.Ptr(1),
+			CheckRuns: []*github.CheckRun{
+				{Name: github.Ptr("ci-build"), Status: github.Ptr("in_progress")},
+			},
+		})
+
+		client := github.NewClient(MockHTTPClientWithHandlers(handlers))
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(1)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 1)
+		assert.Equal(t, "failed", results[0].Status)
+		assert.Contains(t, results[0].Error, "failing checks")
+	})
+
+	// --- Allow-list CI gate: neutral conclusion with completed status passes ---
+
+	t.Run("check run with completed status and neutral conclusion passes", func(t *testing.T) {
+		handlers := happyPathHandlers(t)
+		handlers[GetReposCommitsCheckRunsByOwnerByRepoByRef] = mockResponse(t, http.StatusOK, &github.ListCheckRunsResults{
+			Total: github.Ptr(1),
+			CheckRuns: []*github.CheckRun{
+				{Status: github.Ptr("completed"), Conclusion: github.Ptr("neutral")},
+			},
+		})
+
+		client := github.NewClient(MockHTTPClientWithHandlers(handlers))
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(1)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 1)
+		assert.Equal(t, "merged", results[0].Status)
+	})
+
+	// --- Allow-list CI gate: skipped conclusion with completed status passes ---
+
+	t.Run("check run with completed status and skipped conclusion passes", func(t *testing.T) {
+		handlers := happyPathHandlers(t)
+		handlers[GetReposCommitsCheckRunsByOwnerByRepoByRef] = mockResponse(t, http.StatusOK, &github.ListCheckRunsResults{
+			Total: github.Ptr(1),
+			CheckRuns: []*github.CheckRun{
+				{Status: github.Ptr("completed"), Conclusion: github.Ptr("skipped")},
+			},
+		})
+
+		client := github.NewClient(MockHTTPClientWithHandlers(handlers))
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(1)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 1)
+		assert.Equal(t, "merged", results[0].Status)
+	})
+
+	// --- Allow-list CI gate: pending status with no CI configured passes ---
+
+	t.Run("combined status pending with zero statuses and zero check runs passes", func(t *testing.T) {
+		handlers := happyPathHandlers(t)
+		handlers[GetReposCommitsStatusByOwnerByRepoByRef] = mockResponse(t, http.StatusOK, &github.CombinedStatus{
+			State:    github.Ptr("pending"),
+			Statuses: []*github.RepoStatus{},
+		})
 		handlers[GetReposCommitsCheckRunsByOwnerByRepoByRef] = mockResponse(t, http.StatusOK, &github.ListCheckRunsResults{
 			Total:     github.Ptr(0),
 			CheckRuns: []*github.CheckRun{},
