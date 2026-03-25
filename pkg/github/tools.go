@@ -283,6 +283,7 @@ func AllTools(t translations.TranslationHelperFunc) []inventory.ServerTool {
 		// Compound tools
 		SquashMergeAndCleanup(t),
 		MergePRStack(t),
+		BatchPRStatus(t),
 	}
 }
 

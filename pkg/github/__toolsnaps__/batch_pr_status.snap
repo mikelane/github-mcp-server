@@ -1,0 +1,45 @@
+{
+  "annotations": {
+    "readOnlyHint": true,
+    "title": "Batch pull request status overview"
+  },
+  "description": "Get a structured overview of all pull requests with CI status, review status, linked issues, and age.",
+  "inputSchema": {
+    "properties": {
+      "head": {
+        "description": "Filter by head branch (user:ref-name or org:ref-name)",
+        "type": "string"
+      },
+      "labels": {
+        "description": "Filter pull requests by labels",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "owner": {
+        "description": "Repository owner",
+        "type": "string"
+      },
+      "repo": {
+        "description": "Repository name",
+        "type": "string"
+      },
+      "state": {
+        "description": "Filter pull requests by state (default: open)",
+        "enum": [
+          "open",
+          "closed",
+          "all"
+        ],
+        "type": "string"
+      }
+    },
+    "required": [
+      "owner",
+      "repo"
+    ],
+    "type": "object"
+  },
+  "name": "batch_pr_status"
+}

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 
 	ghErrors "github.com/github/github-mcp-server/pkg/errors"
@@ -453,4 +455,261 @@ func markRemainingSkipped(results []MergePRStackResult, startIdx int) {
 	for j := startIdx; j < len(results); j++ {
 		results[j].Status = "skipped"
 	}
+}
+
+// BatchPRStatusResult holds the structured status for a single pull request.
+type BatchPRStatusResult struct {
+	Number       int      `json:"number"`
+	Title        string   `json:"title"`
+	Author       string   `json:"author"`
+	Branch       string   `json:"branch"`
+	BaseBranch   string   `json:"baseBranch"`
+	CI           string   `json:"ci"`
+	ReviewStatus string   `json:"reviewStatus"`
+	Reviewers    []string `json:"reviewers"`
+	LinkedIssues []int    `json:"linkedIssues"`
+	Mergeable    bool     `json:"mergeable"`
+	Draft        bool     `json:"draft"`
+	CreatedAt    string   `json:"createdAt"`
+	UpdatedAt    string   `json:"updatedAt"`
+	Additions    int      `json:"additions"`
+	Deletions    int      `json:"deletions"`
+	ChangedFiles int      `json:"changedFiles"`
+}
+
+var linkedIssuePattern = regexp.MustCompile(`(?i)(?:closes|fixes|resolves)\s+#(\d+)`)
+
+func BatchPRStatus(t translations.TranslationHelperFunc) inventory.ServerTool {
+	schema := &jsonschema.Schema{
+		Type: "object",
+		Properties: map[string]*jsonschema.Schema{
+			"owner": {
+				Type:        "string",
+				Description: "Repository owner",
+			},
+			"repo": {
+				Type:        "string",
+				Description: "Repository name",
+			},
+			"state": {
+				Type:        "string",
+				Description: "Filter pull requests by state (default: open)",
+				Enum:        []any{"open", "closed", "all"},
+			},
+			"labels": {
+				Type:        "array",
+				Description: "Filter pull requests by labels",
+				Items: &jsonschema.Schema{
+					Type: "string",
+				},
+			},
+			"head": {
+				Type:        "string",
+				Description: "Filter by head branch (user:ref-name or org:ref-name)",
+			},
+		},
+		Required: []string{"owner", "repo"},
+	}
+
+	return NewTool(
+		ToolsetMetadataCompound,
+		mcp.Tool{
+			Name:        "batch_pr_status",
+			Description: t("TOOL_BATCH_PR_STATUS_DESCRIPTION", "Get a structured overview of all pull requests with CI status, review status, linked issues, and age."),
+			Annotations: &mcp.ToolAnnotations{
+				Title:        t("TOOL_BATCH_PR_STATUS_USER_TITLE", "Batch pull request status overview"),
+				ReadOnlyHint: true,
+			},
+			InputSchema: schema,
+		},
+		[]scopes.Scope{scopes.Repo},
+		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
+			owner, err := RequiredParam[string](args, "owner")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			repo, err := RequiredParam[string](args, "repo")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			state, err := OptionalParam[string](args, "state")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			if state == "" {
+				state = "open"
+			}
+			labels, err := OptionalStringArrayParam(args, "labels")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			head, err := OptionalParam[string](args, "head")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+
+			client, err := deps.GetClient(ctx)
+			if err != nil {
+				return utils.NewToolResultErrorFromErr("failed to get GitHub client", err), nil, nil
+			}
+
+			opts := &github.PullRequestListOptions{
+				State: state,
+				Head:  head,
+				ListOptions: github.ListOptions{
+					PerPage: 30,
+				},
+			}
+
+			prs, resp, err := client.PullRequests.List(ctx, owner, repo, opts)
+			if err != nil {
+				return ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to list pull requests", resp, err), nil, nil
+			}
+			defer func() { _ = resp.Body.Close() }()
+
+			// Filter by labels client-side since the List PRs API does not support label filtering
+			if len(labels) > 0 {
+				prs = filterPRsByLabels(prs, labels)
+			}
+
+			results := make([]BatchPRStatusResult, 0, len(prs))
+			for _, pr := range prs {
+				result, err := buildPRStatusResult(ctx, client, owner, repo, pr)
+				if err != nil {
+					return nil, nil, fmt.Errorf("failed to build status for PR #%d: %w", pr.GetNumber(), err)
+				}
+				results = append(results, result)
+			}
+
+			return MarshalledTextResult(results), nil, nil
+		},
+	)
+}
+
+func buildPRStatusResult(ctx context.Context, client *github.Client, owner, repo string, pr *github.PullRequest) (BatchPRStatusResult, error) {
+	headSHA := pr.GetHead().GetSHA()
+
+	// Get combined commit status
+	status, _, err := client.Repositories.GetCombinedStatus(ctx, owner, repo, headSHA, nil)
+	if err != nil {
+		return BatchPRStatusResult{}, fmt.Errorf("failed to get combined status: %w", err)
+	}
+	ciState := status.GetState()
+
+	// Get reviews
+	reviews, _, err := client.PullRequests.ListReviews(ctx, owner, repo, pr.GetNumber(), nil)
+	if err != nil {
+		return BatchPRStatusResult{}, fmt.Errorf("failed to get reviews: %w", err)
+	}
+	reviewStatus, reviewers := summarizeReviews(reviews)
+
+	// Parse linked issues from body
+	linkedIssues := parseLinkedIssues(pr.GetBody())
+
+	return BatchPRStatusResult{
+		Number:       pr.GetNumber(),
+		Title:        pr.GetTitle(),
+		Author:       pr.GetUser().GetLogin(),
+		Branch:       pr.GetHead().GetRef(),
+		BaseBranch:   pr.GetBase().GetRef(),
+		CI:           ciState,
+		ReviewStatus: reviewStatus,
+		Reviewers:    reviewers,
+		LinkedIssues: linkedIssues,
+		Mergeable:    pr.GetMergeable(),
+		Draft:        pr.GetDraft(),
+		CreatedAt:    pr.GetCreatedAt().UTC().Format("2006-01-02T15:04:05Z"),
+		UpdatedAt:    pr.GetUpdatedAt().UTC().Format("2006-01-02T15:04:05Z"),
+		Additions:    pr.GetAdditions(),
+		Deletions:    pr.GetDeletions(),
+		ChangedFiles: pr.GetChangedFiles(),
+	}, nil
+}
+
+func summarizeReviews(reviews []*github.PullRequestReview) (string, []string) {
+	if len(reviews) == 0 {
+		return "none", []string{}
+	}
+
+	// Track the latest review state per reviewer
+	latestByUser := make(map[string]string)
+	for _, review := range reviews {
+		user := review.GetUser().GetLogin()
+		state := strings.ToLower(review.GetState())
+		if user != "" && state != "" {
+			latestByUser[user] = state
+		}
+	}
+
+	if len(latestByUser) == 0 {
+		return "none", []string{}
+	}
+
+	// Determine overall status: changes_requested > approved > pending
+	hasApproved := false
+	hasChangesRequested := false
+	reviewers := make([]string, 0, len(latestByUser))
+	for user, state := range latestByUser {
+		reviewers = append(reviewers, user)
+		switch state {
+		case "approved":
+			hasApproved = true
+		case "changes_requested":
+			hasChangesRequested = true
+		}
+	}
+
+	var status string
+	switch {
+	case hasChangesRequested:
+		status = "changes_requested"
+	case hasApproved:
+		status = "approved"
+	default:
+		status = "pending"
+	}
+
+	return status, reviewers
+}
+
+func parseLinkedIssues(body string) []int {
+	matches := linkedIssuePattern.FindAllStringSubmatch(body, -1)
+	if len(matches) == 0 {
+		return []int{}
+	}
+
+	issues := make([]int, 0, len(matches))
+	for _, match := range matches {
+		if len(match) >= 2 {
+			num, err := strconv.Atoi(match[1])
+			if err == nil {
+				issues = append(issues, num)
+			}
+		}
+	}
+	return issues
+}
+
+func filterPRsByLabels(prs []*github.PullRequest, labels []string) []*github.PullRequest {
+	labelSet := make(map[string]bool, len(labels))
+	for _, l := range labels {
+		labelSet[strings.ToLower(l)] = true
+	}
+
+	filtered := make([]*github.PullRequest, 0)
+	for _, pr := range prs {
+		if prHasAnyLabel(pr, labelSet) {
+			filtered = append(filtered, pr)
+		}
+	}
+	return filtered
+}
+
+func prHasAnyLabel(pr *github.PullRequest, labelSet map[string]bool) bool {
+	for _, label := range pr.Labels {
+		if labelSet[strings.ToLower(label.GetName())] {
+			return true
+		}
+	}
+	return false
 }
