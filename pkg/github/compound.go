@@ -17,12 +17,6 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-var ToolsetMetadataCompound = inventory.ToolsetMetadata{
-	ID:          "compound",
-	Description: "Compound actions combining multiple GitHub operations",
-	Icon:        "workflow",
-}
-
 type squashMergeAndCleanupResult struct {
 	MergedSHA      string `json:"mergedSHA"`
 	BranchName     string `json:"branchName"`
@@ -141,31 +135,28 @@ func SquashMergeAndCleanup(t translations.TranslationHelperFunc) inventory.Serve
 			// Step 4: Verify all checks pass using an allow-list approach.
 			// Combined status must be "success", or "pending" only when no CI is configured.
 			combinedState := combinedStatus.GetState()
-			if combinedState == "success" {
-				// Combined status is green — continue
-			} else if combinedState == "pending" && len(combinedStatus.Statuses) == 0 && len(checkRuns.CheckRuns) == 0 {
-				// No CI configured at all — safe to merge
-			} else {
-				// Any other state (pending with actual checks, failure, error) — reject
-				var failingChecks []string
-				for _, s := range combinedStatus.Statuses {
-					if s.GetState() != "success" {
-						failingChecks = append(failingChecks, fmt.Sprintf("%s (%s)", s.GetContext(), s.GetState()))
-					}
-				}
-				for _, cr := range checkRuns.CheckRuns {
-					if cr.GetStatus() != "completed" || (cr.GetConclusion() != "success" && cr.GetConclusion() != "neutral" && cr.GetConclusion() != "skipped") {
-						status := cr.GetStatus()
-						if status == "completed" {
-							status = cr.GetConclusion()
+			if combinedState != "success" {
+				if combinedState != "pending" || len(combinedStatus.Statuses) != 0 || len(checkRuns.CheckRuns) != 0 {
+					var failingChecks []string
+					for _, s := range combinedStatus.Statuses {
+						if s.GetState() != "success" {
+							failingChecks = append(failingChecks, fmt.Sprintf("%s (%s)", s.GetContext(), s.GetState()))
 						}
-						failingChecks = append(failingChecks, fmt.Sprintf("%s (%s)", cr.GetName(), status))
 					}
+					for _, cr := range checkRuns.CheckRuns {
+						if cr.GetStatus() != "completed" || (cr.GetConclusion() != "success" && cr.GetConclusion() != "neutral" && cr.GetConclusion() != "skipped") {
+							status := cr.GetStatus()
+							if status == "completed" {
+								status = cr.GetConclusion()
+							}
+							failingChecks = append(failingChecks, fmt.Sprintf("%s (%s)", cr.GetName(), status))
+						}
+					}
+					return utils.NewToolResultError(fmt.Sprintf(
+						"cannot merge: checks are not passing (combined status: %s). Failing checks: %s",
+						combinedState, strings.Join(failingChecks, ", "),
+					)), nil, nil
 				}
-				return utils.NewToolResultError(fmt.Sprintf(
-					"cannot merge: checks are not passing (combined status: %s). Failing checks: %s",
-					combinedState, strings.Join(failingChecks, ", "),
-				)), nil, nil
 			}
 
 			// Verify each individual check run has completed successfully
@@ -245,4 +236,221 @@ func SquashMergeAndCleanup(t translations.TranslationHelperFunc) inventory.Serve
 			return utils.NewToolResultText(string(r)), nil, nil
 		},
 	)
+}
+
+// MergePRStackResult represents the outcome of merging a single PR in the stack.
+type MergePRStackResult struct {
+	PullNumber int    `json:"pullNumber"`
+	Status     string `json:"status"`
+	MergedSHA  string `json:"mergedSHA,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
+
+// MergePRStack creates a tool that merges an ordered list of stacked PRs,
+// updating base branches between each merge.
+func MergePRStack(t translations.TranslationHelperFunc) inventory.ServerTool {
+	schema := &jsonschema.Schema{
+		Type: "object",
+		Properties: map[string]*jsonschema.Schema{
+			"owner": {
+				Type:        "string",
+				Description: "Repository owner",
+			},
+			"repo": {
+				Type:        "string",
+				Description: "Repository name",
+			},
+			"pullNumbers": {
+				Type:        "array",
+				Description: "PR numbers in merge order (base PR first)",
+				Items: &jsonschema.Schema{
+					Type: "number",
+				},
+			},
+			"deleteRemoteBranches": {
+				Type:        "boolean",
+				Description: "Delete remote branches after merging (default: true)",
+			},
+		},
+		Required: []string{"owner", "repo", "pullNumbers"},
+	}
+
+	return NewTool(
+		ToolsetMetadataCompound,
+		mcp.Tool{
+			Name:        "merge_pr_stack",
+			Description: t("TOOL_MERGE_PR_STACK_DESCRIPTION", "Merge an ordered list of stacked pull requests, updating base branches between each merge."),
+			Annotations: &mcp.ToolAnnotations{
+				Title:        t("TOOL_MERGE_PR_STACK_USER_TITLE", "Merge PR stack"),
+				ReadOnlyHint: false,
+			},
+			InputSchema: schema,
+		},
+		[]scopes.Scope{scopes.Repo},
+		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
+			owner, err := RequiredParam[string](args, "owner")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			repo, err := RequiredParam[string](args, "repo")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+
+			pullNumbersRaw, ok := args["pullNumbers"]
+			if !ok {
+				return utils.NewToolResultError("missing required parameter: pullNumbers"), nil, nil
+			}
+			pullNumbersSlice, ok := pullNumbersRaw.([]any)
+			if !ok {
+				return utils.NewToolResultError("pullNumbers must be an array"), nil, nil
+			}
+
+			pullNumbers := make([]int, 0, len(pullNumbersSlice))
+			for _, v := range pullNumbersSlice {
+				n, ok := v.(float64)
+				if !ok {
+					return utils.NewToolResultError(fmt.Sprintf("pullNumbers must contain numbers, got %T", v)), nil, nil
+				}
+				pullNumbers = append(pullNumbers, int(n))
+			}
+
+			deleteRemoteBranches := true
+			if val, ok, err := OptionalParamOK[bool](args, "deleteRemoteBranches"); err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			} else if ok {
+				deleteRemoteBranches = val
+			}
+
+			if len(pullNumbers) == 0 {
+				r, err := json.Marshal([]MergePRStackResult{})
+				if err != nil {
+					return utils.NewToolResultError("failed to marshal empty result"), nil, nil
+				}
+				return utils.NewToolResultText(string(r)), nil, nil
+			}
+
+			client, err := deps.GetClient(ctx)
+			if err != nil {
+				return utils.NewToolResultError(fmt.Sprintf("failed to get GitHub client: %v", err)), nil, nil
+			}
+
+			results := mergePRStack(ctx, client, owner, repo, pullNumbers, deleteRemoteBranches)
+
+			r, err := json.Marshal(results)
+			if err != nil {
+				return utils.NewToolResultError("failed to marshal results"), nil, nil
+			}
+			return utils.NewToolResultText(string(r)), nil, nil
+		},
+	)
+}
+
+func mergePRStack(ctx context.Context, client *github.Client, owner, repo string, pullNumbers []int, deleteRemoteBranches bool) []MergePRStackResult {
+	results := make([]MergePRStackResult, len(pullNumbers))
+
+	for i, prNum := range pullNumbers {
+		results[i].PullNumber = prNum
+
+		pr, resp, err := client.PullRequests.Get(ctx, owner, repo, prNum)
+		if err != nil {
+			results[i].Status = "failed"
+			results[i].Error = fmt.Sprintf("failed to get PR #%d: %v", prNum, err)
+			markRemainingSkipped(results, i+1)
+			return results
+		}
+		if resp != nil {
+			defer func() { _ = resp.Body.Close() }()
+		}
+
+		if pr.GetState() != "open" {
+			results[i].Status = "failed"
+			results[i].Error = fmt.Sprintf("PR #%d is not open (state: %s)", prNum, pr.GetState())
+			markRemainingSkipped(results, i+1)
+			return results
+		}
+
+		headSHA := pr.GetHead().GetSHA()
+
+		if !checksPass(ctx, client, owner, repo, headSHA) {
+			results[i].Status = "failed"
+			results[i].Error = fmt.Sprintf("PR #%d has failing checks", prNum)
+			markRemainingSkipped(results, i+1)
+			return results
+		}
+
+		mergeResult, mergeResp, err := client.PullRequests.Merge(ctx, owner, repo, prNum, "", &github.PullRequestOptions{
+			CommitTitle: pr.GetTitle(),
+			MergeMethod: "squash",
+		})
+		if err != nil || mergeResp.StatusCode != http.StatusOK {
+			results[i].Status = "failed"
+			errMsg := fmt.Sprintf("failed to merge PR #%d", prNum)
+			if err != nil {
+				errMsg = fmt.Sprintf("%s: %v", errMsg, err)
+			}
+			results[i].Error = errMsg
+			markRemainingSkipped(results, i+1)
+			return results
+		}
+		defer func() { _ = mergeResp.Body.Close() }()
+
+		results[i].Status = "merged"
+		results[i].MergedSHA = mergeResult.GetSHA()
+
+		if deleteRemoteBranches {
+			branchRef := "heads/" + pr.GetHead().GetRef()
+			// Branch deletion failure is non-fatal; continue with the stack
+			_, _ = client.Git.DeleteRef(ctx, owner, repo, branchRef)
+		}
+
+		// If there are more PRs in the stack, update the next PR's branch
+		if i < len(pullNumbers)-1 {
+			nextPRNum := pullNumbers[i+1]
+			// Branch update errors (including HTTP 202 accepted) are non-fatal
+			_, _, _ = client.PullRequests.UpdateBranch(ctx, owner, repo, nextPRNum, nil)
+		}
+	}
+
+	return results
+}
+
+func checksPass(ctx context.Context, client *github.Client, owner, repo, ref string) bool {
+	combinedStatus, _, err := client.Repositories.GetCombinedStatus(ctx, owner, repo, ref, nil)
+	if err != nil {
+		return false
+	}
+
+	checkRuns, _, err := client.Checks.ListCheckRunsForRef(ctx, owner, repo, ref, nil)
+	if err != nil {
+		return false
+	}
+
+	// Allow-list approach: combined status must be "success", or "pending" only
+	// when no CI is configured (zero statuses and zero check runs).
+	combinedState := combinedStatus.GetState()
+	if combinedState != "success" {
+		if combinedState != "pending" || len(combinedStatus.Statuses) != 0 || len(checkRuns.CheckRuns) != 0 {
+			return false
+		}
+	}
+
+	// Each check run must be completed with an acceptable conclusion.
+	for _, cr := range checkRuns.CheckRuns {
+		if cr.GetStatus() != "completed" {
+			return false
+		}
+		conclusion := cr.GetConclusion()
+		if conclusion != "success" && conclusion != "neutral" && conclusion != "skipped" {
+			return false
+		}
+	}
+
+	return true
+}
+
+func markRemainingSkipped(results []MergePRStackResult, startIdx int) {
+	for j := startIdx; j < len(results); j++ {
+		results[j].Status = "skipped"
+	}
 }

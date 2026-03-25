@@ -1578,3 +1578,1155 @@ func Test_SquashMergeAndCleanup(t *testing.T) {
 		assert.Contains(t, errorContent.Text, "CI")
 	})
 }
+
+func openPRResponse(t *testing.T) http.HandlerFunc {
+	t.Helper()
+	return func(w http.ResponseWriter, _ *http.Request) {
+		pr := &github.PullRequest{
+			Number: github.Ptr(1),
+			State:  github.Ptr("open"),
+			Title:  github.Ptr("PR title"),
+			Body:   github.Ptr("PR body"),
+			Head: &github.PullRequestBranch{
+				SHA: github.Ptr("abc123"),
+				Ref: github.Ptr("feature-branch"),
+			},
+			Base: &github.PullRequestBranch{
+				Ref: github.Ptr("main"),
+			},
+		}
+		w.WriteHeader(http.StatusOK)
+		b, _ := json.Marshal(pr)
+		_, _ = w.Write(b)
+	}
+}
+
+func passingStatusResponse(t *testing.T) http.HandlerFunc {
+	t.Helper()
+	return mockResponse(t, http.StatusOK, &github.CombinedStatus{
+		State: github.Ptr("success"),
+	})
+}
+
+func passingCheckRunsResponse(t *testing.T) http.HandlerFunc {
+	t.Helper()
+	return mockResponse(t, http.StatusOK, &github.ListCheckRunsResults{
+		Total: github.Ptr(1),
+		CheckRuns: []*github.CheckRun{{
+			Status:     github.Ptr("completed"),
+			Conclusion: github.Ptr("success"),
+		}},
+	})
+}
+
+func successfulMergeResponse(t *testing.T) http.HandlerFunc {
+	t.Helper()
+	mergeCount := 0
+	return func(w http.ResponseWriter, _ *http.Request) {
+		mergeCount++
+		result := &github.PullRequestMergeResult{
+			Merged:  github.Ptr(true),
+			Message: github.Ptr("Pull Request successfully merged"),
+			SHA:     github.Ptr(fmt.Sprintf("merged-sha-%d", mergeCount)),
+		}
+		w.WriteHeader(http.StatusOK)
+		b, _ := json.Marshal(result)
+		_, _ = w.Write(b)
+	}
+}
+
+func updateBranchResponse(t *testing.T) http.HandlerFunc {
+	t.Helper()
+	return mockResponse(t, http.StatusAccepted, &github.PullRequestBranchUpdateResponse{
+		Message: github.Ptr("Updating pull request branch."),
+	})
+}
+
+func deleteRefHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func happyPathHandlers(t *testing.T) map[string]http.HandlerFunc {
+	t.Helper()
+	return map[string]http.HandlerFunc{
+		GetReposPullsByOwnerByRepoByPullNumber:                openPRResponse(t),
+		GetReposCommitsStatusByOwnerByRepoByRef:               passingStatusResponse(t),
+		GetReposCommitsCheckRunsByOwnerByRepoByRef:            passingCheckRunsResponse(t),
+		PutReposPullsMergeByOwnerByRepoByPullNumber:           successfulMergeResponse(t),
+		PutReposPullsUpdateBranchByOwnerByRepoByPullNumber:    updateBranchResponse(t),
+		"DELETE /repos/{owner}/{repo}/git/refs/{ref:.*}":      deleteRefHandler(),
+	}
+}
+
+
+func Test_MergePRStack(t *testing.T) {
+	serverTool := MergePRStack(translations.NullTranslationHelper)
+	tool := serverTool.Tool
+	require.NoError(t, toolsnaps.Test(tool.Name, tool))
+
+	assert.Equal(t, "merge_pr_stack", tool.Name)
+	assert.NotEmpty(t, tool.Description)
+	schema := tool.InputSchema.(*jsonschema.Schema)
+	assert.Contains(t, schema.Properties, "owner")
+	assert.Contains(t, schema.Properties, "repo")
+	assert.Contains(t, schema.Properties, "pullNumbers")
+	assert.Contains(t, schema.Properties, "deleteRemoteBranches")
+	assert.ElementsMatch(t, schema.Required, []string{"owner", "repo", "pullNumbers"})
+
+	t.Run("happy path merges 3 PRs in order", func(t *testing.T) {
+		callCount := map[string]int{}
+
+		handlers := happyPathHandlers(t)
+		// Wrap handlers with counting
+		origGetPR := handlers[GetReposPullsByOwnerByRepoByPullNumber]
+		handlers[GetReposPullsByOwnerByRepoByPullNumber] = func(w http.ResponseWriter, r *http.Request) {
+			callCount["get_pr"]++
+			origGetPR(w, r)
+		}
+		origStatus := handlers[GetReposCommitsStatusByOwnerByRepoByRef]
+		handlers[GetReposCommitsStatusByOwnerByRepoByRef] = func(w http.ResponseWriter, r *http.Request) {
+			callCount["get_status"]++
+			origStatus(w, r)
+		}
+		origCheckRuns := handlers[GetReposCommitsCheckRunsByOwnerByRepoByRef]
+		handlers[GetReposCommitsCheckRunsByOwnerByRepoByRef] = func(w http.ResponseWriter, r *http.Request) {
+			callCount["get_check_runs"]++
+			origCheckRuns(w, r)
+		}
+		origMerge := handlers[PutReposPullsMergeByOwnerByRepoByPullNumber]
+		handlers[PutReposPullsMergeByOwnerByRepoByPullNumber] = func(w http.ResponseWriter, r *http.Request) {
+			callCount["merge"]++
+			origMerge(w, r)
+		}
+		origUpdateBranch := handlers[PutReposPullsUpdateBranchByOwnerByRepoByPullNumber]
+		handlers[PutReposPullsUpdateBranchByOwnerByRepoByPullNumber] = func(w http.ResponseWriter, r *http.Request) {
+			callCount["update_branch"]++
+			origUpdateBranch(w, r)
+		}
+		handlers["DELETE /repos/{owner}/{repo}/git/refs/{ref:.*}"] = func(w http.ResponseWriter, _ *http.Request) {
+			callCount["delete_ref"]++
+			w.WriteHeader(http.StatusNoContent)
+		}
+
+		mockedClient := MockHTTPClientWithHandlers(handlers)
+		client := github.NewClient(mockedClient)
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":                "owner",
+			"repo":                 "repo",
+			"pullNumbers":          []any{float64(1), float64(2), float64(3)},
+			"deleteRemoteBranches": true,
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+		require.False(t, result.IsError)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 3)
+		for _, r := range results {
+			assert.Equal(t, "merged", r.Status)
+			assert.NotEmpty(t, r.MergedSHA)
+			assert.Empty(t, r.Error)
+		}
+
+		assert.Equal(t, 3, callCount["get_pr"], "expected 3 PR fetches")
+		assert.Equal(t, 3, callCount["merge"], "expected 3 merges")
+		assert.Equal(t, 2, callCount["update_branch"], "expected 2 branch updates")
+		assert.Equal(t, 3, callCount["delete_ref"], "expected 3 branch deletions")
+	})
+
+	t.Run("middle PR merge fails so first merged second fails third skipped", func(t *testing.T) {
+		mergeCount := 0
+		handlers := happyPathHandlers(t)
+		handlers[PutReposPullsMergeByOwnerByRepoByPullNumber] = func(w http.ResponseWriter, _ *http.Request) {
+			mergeCount++
+			if mergeCount == 2 {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				_, _ = w.Write([]byte(`{"message": "Pull request is not mergeable"}`))
+				return
+			}
+			result := &github.PullRequestMergeResult{
+				Merged:  github.Ptr(true),
+				Message: github.Ptr("Pull Request successfully merged"),
+				SHA:     github.Ptr("merged-sha"),
+			}
+			w.WriteHeader(http.StatusOK)
+			b, _ := json.Marshal(result)
+			_, _ = w.Write(b)
+		}
+
+		client := github.NewClient(MockHTTPClientWithHandlers(handlers))
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(1), float64(2), float64(3)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+		require.False(t, result.IsError)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 3)
+		assert.Equal(t, "merged", results[0].Status)
+		assert.Equal(t, "failed", results[1].Status)
+		assert.Contains(t, results[1].Error, "failed to merge PR")
+		assert.Equal(t, "skipped", results[2].Status)
+	})
+
+	t.Run("single PR in stack merges normally", func(t *testing.T) {
+		mockedClient := MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+			GetReposPullsByOwnerByRepoByPullNumber: mockResponse(t, http.StatusOK, &github.PullRequest{
+				Number: github.Ptr(42),
+				State:  github.Ptr("open"),
+				Title:  github.Ptr("Single PR"),
+				Body:   github.Ptr("body"),
+				Head: &github.PullRequestBranch{
+					SHA: github.Ptr("head-sha"),
+					Ref: github.Ptr("feature"),
+				},
+				Base: &github.PullRequestBranch{Ref: github.Ptr("main")},
+			}),
+			GetReposCommitsStatusByOwnerByRepoByRef: mockResponse(t, http.StatusOK, &github.CombinedStatus{
+				State: github.Ptr("success"),
+			}),
+			GetReposCommitsCheckRunsByOwnerByRepoByRef: mockResponse(t, http.StatusOK, &github.ListCheckRunsResults{
+				Total:     github.Ptr(0),
+				CheckRuns: []*github.CheckRun{},
+			}),
+			PutReposPullsMergeByOwnerByRepoByPullNumber: mockResponse(t, http.StatusOK, &github.PullRequestMergeResult{
+				Merged:  github.Ptr(true),
+				Message: github.Ptr("Merged"),
+				SHA:     github.Ptr("merged-sha-42"),
+			}),
+			"DELETE /repos/{owner}/{repo}/git/refs/{ref:.*}": func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			},
+		})
+
+		client := github.NewClient(mockedClient)
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(42)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+		require.False(t, result.IsError)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 1)
+		assert.Equal(t, "merged", results[0].Status)
+		assert.Equal(t, 42, results[0].PullNumber)
+		assert.Equal(t, "merged-sha-42", results[0].MergedSHA)
+	})
+
+	t.Run("empty pullNumbers array returns empty result", func(t *testing.T) {
+		mockedClient := MockHTTPClientWithHandlers(map[string]http.HandlerFunc{})
+		client := github.NewClient(mockedClient)
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+		require.False(t, result.IsError)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+		assert.Empty(t, results)
+	})
+
+	t.Run("PR not open fails that one and skips rest", func(t *testing.T) {
+		mockedClient := MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+			GetReposPullsByOwnerByRepoByPullNumber: mockResponse(t, http.StatusOK, &github.PullRequest{
+				Number: github.Ptr(10),
+				State:  github.Ptr("closed"),
+				Title:  github.Ptr("Closed PR"),
+				Body:   github.Ptr("body"),
+				Head: &github.PullRequestBranch{
+					SHA: github.Ptr("head-sha"),
+					Ref: github.Ptr("feature"),
+				},
+				Base: &github.PullRequestBranch{Ref: github.Ptr("main")},
+			}),
+		})
+
+		client := github.NewClient(mockedClient)
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(10), float64(11), float64(12)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+		require.False(t, result.IsError)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 3)
+		assert.Equal(t, "failed", results[0].Status)
+		assert.Contains(t, results[0].Error, "not open")
+		assert.Equal(t, "skipped", results[1].Status)
+		assert.Equal(t, "skipped", results[2].Status)
+	})
+
+	// --- Parameter validation error paths ---
+
+	t.Run("missing owner parameter returns error", func(t *testing.T) {
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"repo":        "repo",
+			"pullNumbers": []any{float64(1)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getErrorResult(t, result)
+		assert.Contains(t, textContent.Text, "owner")
+	})
+
+	t.Run("missing repo parameter returns error", func(t *testing.T) {
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"pullNumbers": []any{float64(1)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getErrorResult(t, result)
+		assert.Contains(t, textContent.Text, "repo")
+	})
+
+	t.Run("missing pullNumbers parameter returns error", func(t *testing.T) {
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner": "owner",
+			"repo":  "repo",
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getErrorResult(t, result)
+		assert.Contains(t, textContent.Text, "pullNumbers")
+	})
+
+	t.Run("pullNumbers not an array returns error", func(t *testing.T) {
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": "not-an-array",
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getErrorResult(t, result)
+		assert.Contains(t, textContent.Text, "pullNumbers must be an array")
+	})
+
+	t.Run("pullNumbers containing non-number returns error", func(t *testing.T) {
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{"not-a-number"},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getErrorResult(t, result)
+		assert.Contains(t, textContent.Text, "pullNumbers must contain numbers")
+	})
+
+	t.Run("deleteRemoteBranches wrong type returns error", func(t *testing.T) {
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":                "owner",
+			"repo":                 "repo",
+			"pullNumbers":          []any{float64(1)},
+			"deleteRemoteBranches": "not-a-bool",
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getErrorResult(t, result)
+		assert.Contains(t, textContent.Text, "deleteRemoteBranches")
+	})
+
+	t.Run("GetClient error returns tool error", func(t *testing.T) {
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := stubDeps{clientFn: stubClientFnErr("auth token expired")}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(1)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getErrorResult(t, result)
+		assert.Contains(t, textContent.Text, "failed to get GitHub client")
+		assert.Contains(t, textContent.Text, "auth token expired")
+	})
+
+	// --- PR fetch error ---
+
+	t.Run("PR fetch API error fails and skips remaining", func(t *testing.T) {
+		handlers := map[string]http.HandlerFunc{
+			GetReposPullsByOwnerByRepoByPullNumber: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"message": "Not Found"}`))
+			},
+		}
+
+		client := github.NewClient(MockHTTPClientWithHandlers(handlers))
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(999), float64(1000)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+		require.False(t, result.IsError)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 2)
+		assert.Equal(t, "failed", results[0].Status)
+		assert.Contains(t, results[0].Error, "failed to get PR #999")
+		assert.Equal(t, "skipped", results[1].Status)
+	})
+
+	// --- checksPass coverage ---
+
+	t.Run("combined status failure causes PR to fail", func(t *testing.T) {
+		handlers := happyPathHandlers(t)
+		handlers[GetReposCommitsStatusByOwnerByRepoByRef] = mockResponse(t, http.StatusOK, &github.CombinedStatus{
+			State: github.Ptr("failure"),
+		})
+
+		client := github.NewClient(MockHTTPClientWithHandlers(handlers))
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(1), float64(2)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 2)
+		assert.Equal(t, "failed", results[0].Status)
+		assert.Contains(t, results[0].Error, "failing checks")
+		assert.Equal(t, "skipped", results[1].Status)
+	})
+
+	t.Run("combined status error causes PR to fail", func(t *testing.T) {
+		handlers := happyPathHandlers(t)
+		handlers[GetReposCommitsStatusByOwnerByRepoByRef] = mockResponse(t, http.StatusOK, &github.CombinedStatus{
+			State: github.Ptr("error"),
+		})
+
+		client := github.NewClient(MockHTTPClientWithHandlers(handlers))
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(5)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 1)
+		assert.Equal(t, "failed", results[0].Status)
+		assert.Contains(t, results[0].Error, "failing checks")
+	})
+
+	t.Run("GetCombinedStatus API error causes PR to fail", func(t *testing.T) {
+		handlers := happyPathHandlers(t)
+		handlers[GetReposCommitsStatusByOwnerByRepoByRef] = func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"message": "Internal Server Error"}`))
+		}
+
+		client := github.NewClient(MockHTTPClientWithHandlers(handlers))
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(1)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 1)
+		assert.Equal(t, "failed", results[0].Status)
+		assert.Contains(t, results[0].Error, "failing checks")
+	})
+
+	t.Run("ListCheckRunsForRef API error causes PR to fail", func(t *testing.T) {
+		handlers := happyPathHandlers(t)
+		handlers[GetReposCommitsCheckRunsByOwnerByRepoByRef] = func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"message": "Internal Server Error"}`))
+		}
+
+		client := github.NewClient(MockHTTPClientWithHandlers(handlers))
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(1), float64(2)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 2)
+		assert.Equal(t, "failed", results[0].Status)
+		assert.Contains(t, results[0].Error, "failing checks")
+		assert.Equal(t, "skipped", results[1].Status)
+	})
+
+	t.Run("check run with cancelled conclusion causes PR to fail", func(t *testing.T) {
+		handlers := happyPathHandlers(t)
+		handlers[GetReposCommitsCheckRunsByOwnerByRepoByRef] = mockResponse(t, http.StatusOK, &github.ListCheckRunsResults{
+			Total: github.Ptr(1),
+			CheckRuns: []*github.CheckRun{
+				{Conclusion: github.Ptr("cancelled")},
+			},
+		})
+
+		client := github.NewClient(MockHTTPClientWithHandlers(handlers))
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(1)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 1)
+		assert.Equal(t, "failed", results[0].Status)
+		assert.Contains(t, results[0].Error, "failing checks")
+	})
+
+	t.Run("check run with timed_out conclusion causes PR to fail", func(t *testing.T) {
+		handlers := happyPathHandlers(t)
+		handlers[GetReposCommitsCheckRunsByOwnerByRepoByRef] = mockResponse(t, http.StatusOK, &github.ListCheckRunsResults{
+			Total: github.Ptr(1),
+			CheckRuns: []*github.CheckRun{
+				{Conclusion: github.Ptr("timed_out")},
+			},
+		})
+
+		client := github.NewClient(MockHTTPClientWithHandlers(handlers))
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(7)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 1)
+		assert.Equal(t, "failed", results[0].Status)
+	})
+
+	t.Run("check run with action_required conclusion causes PR to fail", func(t *testing.T) {
+		handlers := happyPathHandlers(t)
+		handlers[GetReposCommitsCheckRunsByOwnerByRepoByRef] = mockResponse(t, http.StatusOK, &github.ListCheckRunsResults{
+			Total: github.Ptr(1),
+			CheckRuns: []*github.CheckRun{
+				{Conclusion: github.Ptr("action_required")},
+			},
+		})
+
+		client := github.NewClient(MockHTTPClientWithHandlers(handlers))
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(8)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 1)
+		assert.Equal(t, "failed", results[0].Status)
+	})
+
+	t.Run("check runs with neutral and skipped conclusions pass", func(t *testing.T) {
+		handlers := happyPathHandlers(t)
+		handlers[GetReposCommitsCheckRunsByOwnerByRepoByRef] = mockResponse(t, http.StatusOK, &github.ListCheckRunsResults{
+			Total: github.Ptr(3),
+			CheckRuns: []*github.CheckRun{
+				{Status: github.Ptr("completed"), Conclusion: github.Ptr("neutral")},
+				{Status: github.Ptr("completed"), Conclusion: github.Ptr("skipped")},
+				{Status: github.Ptr("completed"), Conclusion: github.Ptr("success")},
+			},
+		})
+
+		client := github.NewClient(MockHTTPClientWithHandlers(handlers))
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(1)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 1)
+		assert.Equal(t, "merged", results[0].Status)
+	})
+
+	// --- Triangulation: stack ordering with 2 PRs ---
+
+	t.Run("2-PR stack merges both with one branch update", func(t *testing.T) {
+		updateBranchCount := 0
+		handlers := happyPathHandlers(t)
+		origUpdate := handlers[PutReposPullsUpdateBranchByOwnerByRepoByPullNumber]
+		handlers[PutReposPullsUpdateBranchByOwnerByRepoByPullNumber] = func(w http.ResponseWriter, r *http.Request) {
+			updateBranchCount++
+			origUpdate(w, r)
+		}
+
+		client := github.NewClient(MockHTTPClientWithHandlers(handlers))
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(10), float64(20)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+		require.False(t, result.IsError)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 2)
+		assert.Equal(t, "merged", results[0].Status)
+		assert.Equal(t, "merged", results[1].Status)
+		assert.Equal(t, 1, updateBranchCount, "expected exactly 1 branch update between 2 PRs")
+	})
+
+	// --- Triangulation: first PR fails, all others skipped ---
+
+	t.Run("first PR in stack fails so all remaining are skipped", func(t *testing.T) {
+		handlers := happyPathHandlers(t)
+		handlers[GetReposCommitsCheckRunsByOwnerByRepoByRef] = mockResponse(t, http.StatusOK, &github.ListCheckRunsResults{
+			Total: github.Ptr(1),
+			CheckRuns: []*github.CheckRun{
+				{Conclusion: github.Ptr("failure")},
+			},
+		})
+
+		client := github.NewClient(MockHTTPClientWithHandlers(handlers))
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(1), float64(2), float64(3)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 3)
+		assert.Equal(t, "failed", results[0].Status)
+		assert.Contains(t, results[0].Error, "failing checks")
+		assert.Equal(t, "skipped", results[1].Status)
+		assert.Equal(t, "skipped", results[2].Status)
+	})
+
+	// --- Triangulation: last PR fails, first N-1 merged ---
+
+	t.Run("last PR in 3-stack fails so first two merged", func(t *testing.T) {
+		mergeCount := 0
+		handlers := happyPathHandlers(t)
+		handlers[PutReposPullsMergeByOwnerByRepoByPullNumber] = func(w http.ResponseWriter, _ *http.Request) {
+			mergeCount++
+			if mergeCount == 3 {
+				w.WriteHeader(http.StatusConflict)
+				_, _ = w.Write([]byte(`{"message": "merge conflict"}`))
+				return
+			}
+			result := &github.PullRequestMergeResult{
+				Merged:  github.Ptr(true),
+				Message: github.Ptr("merged"),
+				SHA:     github.Ptr(fmt.Sprintf("sha-%d", mergeCount)),
+			}
+			w.WriteHeader(http.StatusOK)
+			b, _ := json.Marshal(result)
+			_, _ = w.Write(b)
+		}
+
+		client := github.NewClient(MockHTTPClientWithHandlers(handlers))
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(1), float64(2), float64(3)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 3)
+		assert.Equal(t, "merged", results[0].Status)
+		assert.Equal(t, "sha-1", results[0].MergedSHA)
+		assert.Equal(t, "merged", results[1].Status)
+		assert.Equal(t, "sha-2", results[1].MergedSHA)
+		assert.Equal(t, "failed", results[2].Status)
+		assert.Contains(t, results[2].Error, "failed to merge PR")
+	})
+
+	// --- deleteRemoteBranches=false skips branch deletion ---
+
+	t.Run("deleteRemoteBranches false skips branch deletion", func(t *testing.T) {
+		deleteRefCalled := false
+		handlers := happyPathHandlers(t)
+		handlers["DELETE /repos/{owner}/{repo}/git/refs/{ref:.*}"] = func(w http.ResponseWriter, _ *http.Request) {
+			deleteRefCalled = true
+			w.WriteHeader(http.StatusNoContent)
+		}
+
+		client := github.NewClient(MockHTTPClientWithHandlers(handlers))
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":                "owner",
+			"repo":                 "repo",
+			"pullNumbers":          []any{float64(1)},
+			"deleteRemoteBranches": false,
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+		require.False(t, result.IsError)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 1)
+		assert.Equal(t, "merged", results[0].Status)
+		assert.False(t, deleteRefCalled, "branch deletion handler was called despite deleteRemoteBranches=false")
+	})
+
+	// --- Merge API error with non-nil error (distinct from status-code-only failure) ---
+
+	t.Run("merge API returns error object with non-200 status", func(t *testing.T) {
+		handlers := happyPathHandlers(t)
+		handlers[PutReposPullsMergeByOwnerByRepoByPullNumber] = func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"message": "Head branch was modified"}`))
+		}
+
+		client := github.NewClient(MockHTTPClientWithHandlers(handlers))
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(1)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 1)
+		assert.Equal(t, "failed", results[0].Status)
+		assert.Contains(t, results[0].Error, "failed to merge PR #1")
+	})
+
+	// --- Combined status pending passes (not failure/error) ---
+
+	t.Run("combined status pending with check runs rejects merge", func(t *testing.T) {
+		handlers := happyPathHandlers(t)
+		handlers[GetReposCommitsStatusByOwnerByRepoByRef] = mockResponse(t, http.StatusOK, &github.CombinedStatus{
+			State: github.Ptr("pending"),
+		})
+
+		client := github.NewClient(MockHTTPClientWithHandlers(handlers))
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(1)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 1)
+		assert.Equal(t, "failed", results[0].Status)
+		assert.Contains(t, results[0].Error, "failing checks")
+	})
+
+	// --- No check runs at all passes ---
+
+	t.Run("no check runs with success status passes", func(t *testing.T) {
+		handlers := happyPathHandlers(t)
+		handlers[GetReposCommitsCheckRunsByOwnerByRepoByRef] = mockResponse(t, http.StatusOK, &github.ListCheckRunsResults{
+			Total:     github.Ptr(0),
+			CheckRuns: []*github.CheckRun{},
+		})
+
+		client := github.NewClient(MockHTTPClientWithHandlers(handlers))
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(1)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 1)
+		assert.Equal(t, "merged", results[0].Status)
+	})
+
+	// --- Allow-list CI gate: in_progress check run (the critical bug) ---
+
+	t.Run("check run with in_progress status and no conclusion rejects merge", func(t *testing.T) {
+		handlers := happyPathHandlers(t)
+		handlers[GetReposCommitsCheckRunsByOwnerByRepoByRef] = mockResponse(t, http.StatusOK, &github.ListCheckRunsResults{
+			Total: github.Ptr(1),
+			CheckRuns: []*github.CheckRun{
+				{Name: github.Ptr("ci-build"), Status: github.Ptr("in_progress")},
+			},
+		})
+
+		client := github.NewClient(MockHTTPClientWithHandlers(handlers))
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(1)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 1)
+		assert.Equal(t, "failed", results[0].Status)
+		assert.Contains(t, results[0].Error, "failing checks")
+	})
+
+	// --- Allow-list CI gate: neutral conclusion with completed status passes ---
+
+	t.Run("check run with completed status and neutral conclusion passes", func(t *testing.T) {
+		handlers := happyPathHandlers(t)
+		handlers[GetReposCommitsCheckRunsByOwnerByRepoByRef] = mockResponse(t, http.StatusOK, &github.ListCheckRunsResults{
+			Total: github.Ptr(1),
+			CheckRuns: []*github.CheckRun{
+				{Status: github.Ptr("completed"), Conclusion: github.Ptr("neutral")},
+			},
+		})
+
+		client := github.NewClient(MockHTTPClientWithHandlers(handlers))
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(1)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 1)
+		assert.Equal(t, "merged", results[0].Status)
+	})
+
+	// --- Allow-list CI gate: skipped conclusion with completed status passes ---
+
+	t.Run("check run with completed status and skipped conclusion passes", func(t *testing.T) {
+		handlers := happyPathHandlers(t)
+		handlers[GetReposCommitsCheckRunsByOwnerByRepoByRef] = mockResponse(t, http.StatusOK, &github.ListCheckRunsResults{
+			Total: github.Ptr(1),
+			CheckRuns: []*github.CheckRun{
+				{Status: github.Ptr("completed"), Conclusion: github.Ptr("skipped")},
+			},
+		})
+
+		client := github.NewClient(MockHTTPClientWithHandlers(handlers))
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(1)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 1)
+		assert.Equal(t, "merged", results[0].Status)
+	})
+
+	// --- Allow-list CI gate: pending status with no CI configured passes ---
+
+	t.Run("combined status pending with zero statuses and zero check runs passes", func(t *testing.T) {
+		handlers := happyPathHandlers(t)
+		handlers[GetReposCommitsStatusByOwnerByRepoByRef] = mockResponse(t, http.StatusOK, &github.CombinedStatus{
+			State:    github.Ptr("pending"),
+			Statuses: []*github.RepoStatus{},
+		})
+		handlers[GetReposCommitsCheckRunsByOwnerByRepoByRef] = mockResponse(t, http.StatusOK, &github.ListCheckRunsResults{
+			Total:     github.Ptr(0),
+			CheckRuns: []*github.CheckRun{},
+		})
+
+		client := github.NewClient(MockHTTPClientWithHandlers(handlers))
+		serverTool := MergePRStack(translations.NullTranslationHelper)
+		deps := BaseDeps{Client: client}
+		handler := serverTool.Handler(deps)
+
+		request := createMCPRequest(map[string]any{
+			"owner":       "owner",
+			"repo":        "repo",
+			"pullNumbers": []any{float64(1)},
+		})
+
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+
+		textContent := getTextResult(t, result)
+		var results []MergePRStackResult
+		err = json.Unmarshal([]byte(textContent.Text), &results)
+		require.NoError(t, err)
+
+		require.Len(t, results, 1)
+		assert.Equal(t, "merged", results[0].Status)
+	})
+}

@@ -1,0 +1,36 @@
+{
+  "annotations": {
+    "title": "Merge PR stack"
+  },
+  "description": "Merge an ordered list of stacked pull requests, updating base branches between each merge.",
+  "inputSchema": {
+    "properties": {
+      "deleteRemoteBranches": {
+        "description": "Delete remote branches after merging (default: true)",
+        "type": "boolean"
+      },
+      "owner": {
+        "description": "Repository owner",
+        "type": "string"
+      },
+      "pullNumbers": {
+        "description": "PR numbers in merge order (base PR first)",
+        "items": {
+          "type": "number"
+        },
+        "type": "array"
+      },
+      "repo": {
+        "description": "Repository name",
+        "type": "string"
+      }
+    },
+    "required": [
+      "owner",
+      "repo",
+      "pullNumbers"
+    ],
+    "type": "object"
+  },
+  "name": "merge_pr_stack"
+}
