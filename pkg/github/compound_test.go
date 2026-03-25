@@ -1582,7 +1582,6 @@ func Test_SquashMergeAndCleanup(t *testing.T) {
 	})
 }
 
-<<<<<<< HEAD
 func openPRResponse(t *testing.T) http.HandlerFunc {
 	t.Helper()
 	return func(w http.ResponseWriter, _ *http.Request) {
@@ -2758,94 +2757,90 @@ func Test_BatchPRStatus(t *testing.T) {
 	now := time.Now().UTC()
 	yesterday := now.Add(-24 * time.Hour)
 
+	// makePR is a helper to reduce boilerplate when constructing test PRs.
+	makePR := func(opts struct {
+		number   int
+		title    string
+		author   string
+		headRef  string
+		headSHA  string
+		baseRef  string
+		body     string
+		draft    bool
+		merge    bool
+		adds     int
+		dels     int
+		files    int
+		labels   []*github.Label
+	}) *github.PullRequest {
+		pr := &github.PullRequest{
+			Number:       github.Ptr(opts.number),
+			Title:        github.Ptr(opts.title),
+			Draft:        github.Ptr(opts.draft),
+			Mergeable:    github.Ptr(opts.merge),
+			Additions:    github.Ptr(opts.adds),
+			Deletions:    github.Ptr(opts.dels),
+			ChangedFiles: github.Ptr(opts.files),
+			CreatedAt:    &github.Timestamp{Time: yesterday},
+			UpdatedAt:    &github.Timestamp{Time: now},
+			Body:         github.Ptr(opts.body),
+			User:         &github.User{Login: github.Ptr(opts.author)},
+			Head: &github.PullRequestBranch{
+				Ref: github.Ptr(opts.headRef),
+				SHA: github.Ptr(opts.headSHA),
+			},
+			Base: &github.PullRequestBranch{Ref: github.Ptr(opts.baseRef)},
+		}
+		if opts.labels != nil {
+			pr.Labels = opts.labels
+		}
+		return pr
+	}
+
 	tests := []struct {
-		name         string
-		mockedClient *http.Client
-		requestArgs  map[string]any
-		expectError  bool
-		expectedLen  int
-		validate     func(t *testing.T, results []BatchPRStatusResult)
+		name           string
+		mockedClient   *http.Client
+		requestArgs    map[string]any
+		expectError    bool
+		expectFuncErr  bool // expect the handler to return a non-nil error (not tool error)
+		expectedLen    int
+		validate       func(t *testing.T, results []BatchPRStatusResult)
 	}{
 		{
 			name: "returns statuses for 3 open PRs with different CI and review states",
 			mockedClient: MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
 				GetReposPullsByOwnerByRepo: mockResponse(t, http.StatusOK, []*github.PullRequest{
-					{
-						Number:       github.Ptr(1),
-						Title:        github.Ptr("feat: add auth"),
-						Draft:        github.Ptr(false),
-						Mergeable:    github.Ptr(true),
-						Additions:    github.Ptr(150),
-						Deletions:    github.Ptr(30),
-						ChangedFiles: github.Ptr(5),
-						CreatedAt:    &github.Timestamp{Time: yesterday},
-						UpdatedAt:    &github.Timestamp{Time: now},
-						Body:         github.Ptr("Closes #41"),
-						User:         &github.User{Login: github.Ptr("alice")},
-						Head: &github.PullRequestBranch{
-							Ref: github.Ptr("issue-41-auth"),
-							SHA: github.Ptr("sha1"),
-						},
-						Base: &github.PullRequestBranch{Ref: github.Ptr("main")},
-					},
-					{
-						Number:       github.Ptr(2),
-						Title:        github.Ptr("fix: broken tests"),
-						Draft:        github.Ptr(false),
-						Mergeable:    github.Ptr(false),
-						Additions:    github.Ptr(10),
-						Deletions:    github.Ptr(5),
-						ChangedFiles: github.Ptr(2),
-						CreatedAt:    &github.Timestamp{Time: yesterday},
-						UpdatedAt:    &github.Timestamp{Time: now},
-						Body:         github.Ptr("No linked issues"),
-						User:         &github.User{Login: github.Ptr("bob")},
-						Head: &github.PullRequestBranch{
-							Ref: github.Ptr("fix-tests"),
-							SHA: github.Ptr("sha2"),
-						},
-						Base: &github.PullRequestBranch{Ref: github.Ptr("main")},
-					},
-					{
-						Number:       github.Ptr(3),
-						Title:        github.Ptr("chore: update deps"),
-						Draft:        github.Ptr(true),
-						Mergeable:    github.Ptr(true),
-						Additions:    github.Ptr(200),
-						Deletions:    github.Ptr(100),
-						ChangedFiles: github.Ptr(1),
-						CreatedAt:    &github.Timestamp{Time: yesterday},
-						UpdatedAt:    &github.Timestamp{Time: now},
-						Body:         github.Ptr(""),
-						User:         &github.User{Login: github.Ptr("carol")},
-						Head: &github.PullRequestBranch{
-							Ref: github.Ptr("update-deps"),
-							SHA: github.Ptr("sha3"),
-						},
-						Base: &github.PullRequestBranch{Ref: github.Ptr("main")},
-					},
+					makePR(struct {
+						number  int; title string; author string; headRef string; headSHA string
+						baseRef string; body string; draft bool; merge bool
+						adds    int; dels int; files int; labels []*github.Label
+					}{1, "feat: add auth", "alice", "issue-41-auth", "sha1", "main", "Closes #41", false, true, 150, 30, 5, nil}),
+					makePR(struct {
+						number  int; title string; author string; headRef string; headSHA string
+						baseRef string; body string; draft bool; merge bool
+						adds    int; dels int; files int; labels []*github.Label
+					}{2, "fix: broken tests", "bob", "fix-tests", "sha2", "main", "No linked issues", false, false, 10, 5, 2, nil}),
+					makePR(struct {
+						number  int; title string; author string; headRef string; headSHA string
+						baseRef string; body string; draft bool; merge bool
+						adds    int; dels int; files int; labels []*github.Label
+					}{3, "chore: update deps", "carol", "update-deps", "sha3", "main", "", true, true, 200, 100, 1, nil}),
 				}),
-				// Combined status for PR #1 (passing)
 				"GET /repos/owner/repo/commits/sha1/status": mockResponse(t, http.StatusOK, &github.CombinedStatus{
 					State: github.Ptr("success"),
 				}),
-				// Combined status for PR #2 (failing)
 				"GET /repos/owner/repo/commits/sha2/status": mockResponse(t, http.StatusOK, &github.CombinedStatus{
 					State: github.Ptr("failure"),
 				}),
-				// Combined status for PR #3 (pending)
 				"GET /repos/owner/repo/commits/sha3/status": mockResponse(t, http.StatusOK, &github.CombinedStatus{
 					State: github.Ptr("pending"),
 				}),
-				// Reviews for PR #1 (approved)
 				"GET /repos/owner/repo/pulls/1/reviews": mockResponse(t, http.StatusOK, []*github.PullRequestReview{
 					{User: &github.User{Login: github.Ptr("reviewer1")}, State: github.Ptr("APPROVED")},
 				}),
-				// Reviews for PR #2 (changes requested)
 				"GET /repos/owner/repo/pulls/2/reviews": mockResponse(t, http.StatusOK, []*github.PullRequestReview{
 					{User: &github.User{Login: github.Ptr("reviewer2")}, State: github.Ptr("CHANGES_REQUESTED")},
 				}),
-				// Reviews for PR #3 (no reviews)
 				"GET /repos/owner/repo/pulls/3/reviews": mockResponse(t, http.StatusOK, []*github.PullRequestReview{}),
 			}),
 			requestArgs: map[string]any{
@@ -2913,46 +2908,18 @@ func Test_BatchPRStatus(t *testing.T) {
 					"state":    "open",
 					"per_page": "30",
 				}).andThen(mockResponse(t, http.StatusOK, []*github.PullRequest{
-					{
-						Number:       github.Ptr(10),
-						Title:        github.Ptr("labeled PR"),
-						Draft:        github.Ptr(false),
-						Mergeable:    github.Ptr(true),
-						Additions:    github.Ptr(5),
-						Deletions:    github.Ptr(2),
-						ChangedFiles: github.Ptr(1),
-						CreatedAt:    &github.Timestamp{Time: yesterday},
-						UpdatedAt:    &github.Timestamp{Time: now},
-						Body:         github.Ptr(""),
-						User:         &github.User{Login: github.Ptr("dev")},
-						Labels: []*github.Label{
-							{Name: github.Ptr("bug")},
-						},
-						Head: &github.PullRequestBranch{
-							Ref: github.Ptr("fix-bug"),
-							SHA: github.Ptr("shaX"),
-						},
-						Base: &github.PullRequestBranch{Ref: github.Ptr("main")},
-					},
-					{
-						Number:       github.Ptr(11),
-						Title:        github.Ptr("unlabeled PR"),
-						Draft:        github.Ptr(false),
-						Mergeable:    github.Ptr(true),
-						Additions:    github.Ptr(1),
-						Deletions:    github.Ptr(1),
-						ChangedFiles: github.Ptr(1),
-						CreatedAt:    &github.Timestamp{Time: yesterday},
-						UpdatedAt:    &github.Timestamp{Time: now},
-						Body:         github.Ptr(""),
-						User:         &github.User{Login: github.Ptr("dev2")},
-						Labels:       []*github.Label{},
-						Head: &github.PullRequestBranch{
-							Ref: github.Ptr("other"),
-							SHA: github.Ptr("shaY"),
-						},
-						Base: &github.PullRequestBranch{Ref: github.Ptr("main")},
-					},
+					makePR(struct {
+						number  int; title string; author string; headRef string; headSHA string
+						baseRef string; body string; draft bool; merge bool
+						adds    int; dels int; files int; labels []*github.Label
+					}{10, "labeled PR", "dev", "fix-bug", "shaX", "main", "", false, true, 5, 2, 1,
+						[]*github.Label{{Name: github.Ptr("bug")}}}),
+					makePR(struct {
+						number  int; title string; author string; headRef string; headSHA string
+						baseRef string; body string; draft bool; merge bool
+						adds    int; dels int; files int; labels []*github.Label
+					}{11, "unlabeled PR", "dev2", "other", "shaY", "main", "", false, true, 1, 1, 1,
+						[]*github.Label{}}),
 				})),
 				"GET /repos/owner/repo/commits/shaX/status": mockResponse(t, http.StatusOK, &github.CombinedStatus{
 					State: github.Ptr("success"),
@@ -2976,24 +2943,11 @@ func Test_BatchPRStatus(t *testing.T) {
 			name: "parses Closes and Fixes patterns from PR body",
 			mockedClient: MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
 				GetReposPullsByOwnerByRepo: mockResponse(t, http.StatusOK, []*github.PullRequest{
-					{
-						Number:       github.Ptr(20),
-						Title:        github.Ptr("multi-close PR"),
-						Draft:        github.Ptr(false),
-						Mergeable:    github.Ptr(true),
-						Additions:    github.Ptr(50),
-						Deletions:    github.Ptr(10),
-						ChangedFiles: github.Ptr(3),
-						CreatedAt:    &github.Timestamp{Time: yesterday},
-						UpdatedAt:    &github.Timestamp{Time: now},
-						Body:         github.Ptr("Closes #5, Fixes #10, Resolves #15"),
-						User:         &github.User{Login: github.Ptr("dev")},
-						Head: &github.PullRequestBranch{
-							Ref: github.Ptr("multi-fix"),
-							SHA: github.Ptr("shaM"),
-						},
-						Base: &github.PullRequestBranch{Ref: github.Ptr("main")},
-					},
+					makePR(struct {
+						number  int; title string; author string; headRef string; headSHA string
+						baseRef string; body string; draft bool; merge bool
+						adds    int; dels int; files int; labels []*github.Label
+					}{20, "multi-close PR", "dev", "multi-fix", "shaM", "main", "Closes #5, Fixes #10, Resolves #15", false, true, 50, 10, 3, nil}),
 				}),
 				"GET /repos/owner/repo/commits/shaM/status": mockResponse(t, http.StatusOK, &github.CombinedStatus{
 					State: github.Ptr("success"),
@@ -3015,24 +2969,11 @@ func Test_BatchPRStatus(t *testing.T) {
 			name: "marks draft PRs correctly",
 			mockedClient: MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
 				GetReposPullsByOwnerByRepo: mockResponse(t, http.StatusOK, []*github.PullRequest{
-					{
-						Number:       github.Ptr(30),
-						Title:        github.Ptr("draft PR"),
-						Draft:        github.Ptr(true),
-						Mergeable:    github.Ptr(false),
-						Additions:    github.Ptr(1),
-						Deletions:    github.Ptr(0),
-						ChangedFiles: github.Ptr(1),
-						CreatedAt:    &github.Timestamp{Time: yesterday},
-						UpdatedAt:    &github.Timestamp{Time: now},
-						Body:         github.Ptr("WIP"),
-						User:         &github.User{Login: github.Ptr("dev")},
-						Head: &github.PullRequestBranch{
-							Ref: github.Ptr("wip-branch"),
-							SHA: github.Ptr("shaD"),
-						},
-						Base: &github.PullRequestBranch{Ref: github.Ptr("main")},
-					},
+					makePR(struct {
+						number  int; title string; author string; headRef string; headSHA string
+						baseRef string; body string; draft bool; merge bool
+						adds    int; dels int; files int; labels []*github.Label
+					}{30, "draft PR", "dev", "wip-branch", "shaD", "main", "WIP", true, false, 1, 0, 1, nil}),
 				}),
 				"GET /repos/owner/repo/commits/shaD/status": mockResponse(t, http.StatusOK, &github.CombinedStatus{
 					State: github.Ptr("pending"),
@@ -3054,60 +2995,21 @@ func Test_BatchPRStatus(t *testing.T) {
 			name: "handles mixed CI statuses correctly",
 			mockedClient: MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
 				GetReposPullsByOwnerByRepo: mockResponse(t, http.StatusOK, []*github.PullRequest{
-					{
-						Number:       github.Ptr(40),
-						Title:        github.Ptr("passing"),
-						Draft:        github.Ptr(false),
-						Mergeable:    github.Ptr(true),
-						Additions:    github.Ptr(10),
-						Deletions:    github.Ptr(5),
-						ChangedFiles: github.Ptr(2),
-						CreatedAt:    &github.Timestamp{Time: yesterday},
-						UpdatedAt:    &github.Timestamp{Time: now},
-						Body:         github.Ptr(""),
-						User:         &github.User{Login: github.Ptr("dev")},
-						Head: &github.PullRequestBranch{
-							Ref: github.Ptr("branch-a"),
-							SHA: github.Ptr("shaA"),
-						},
-						Base: &github.PullRequestBranch{Ref: github.Ptr("main")},
-					},
-					{
-						Number:       github.Ptr(41),
-						Title:        github.Ptr("failing"),
-						Draft:        github.Ptr(false),
-						Mergeable:    github.Ptr(false),
-						Additions:    github.Ptr(20),
-						Deletions:    github.Ptr(10),
-						ChangedFiles: github.Ptr(3),
-						CreatedAt:    &github.Timestamp{Time: yesterday},
-						UpdatedAt:    &github.Timestamp{Time: now},
-						Body:         github.Ptr(""),
-						User:         &github.User{Login: github.Ptr("dev2")},
-						Head: &github.PullRequestBranch{
-							Ref: github.Ptr("branch-b"),
-							SHA: github.Ptr("shaB"),
-						},
-						Base: &github.PullRequestBranch{Ref: github.Ptr("main")},
-					},
-					{
-						Number:       github.Ptr(42),
-						Title:        github.Ptr("pending"),
-						Draft:        github.Ptr(false),
-						Mergeable:    github.Ptr(true),
-						Additions:    github.Ptr(5),
-						Deletions:    github.Ptr(2),
-						ChangedFiles: github.Ptr(1),
-						CreatedAt:    &github.Timestamp{Time: yesterday},
-						UpdatedAt:    &github.Timestamp{Time: now},
-						Body:         github.Ptr(""),
-						User:         &github.User{Login: github.Ptr("dev3")},
-						Head: &github.PullRequestBranch{
-							Ref: github.Ptr("branch-c"),
-							SHA: github.Ptr("shaC"),
-						},
-						Base: &github.PullRequestBranch{Ref: github.Ptr("main")},
-					},
+					makePR(struct {
+						number  int; title string; author string; headRef string; headSHA string
+						baseRef string; body string; draft bool; merge bool
+						adds    int; dels int; files int; labels []*github.Label
+					}{40, "passing", "dev", "branch-a", "shaA", "main", "", false, true, 10, 5, 2, nil}),
+					makePR(struct {
+						number  int; title string; author string; headRef string; headSHA string
+						baseRef string; body string; draft bool; merge bool
+						adds    int; dels int; files int; labels []*github.Label
+					}{41, "failing", "dev2", "branch-b", "shaB", "main", "", false, false, 20, 10, 3, nil}),
+					makePR(struct {
+						number  int; title string; author string; headRef string; headSHA string
+						baseRef string; body string; draft bool; merge bool
+						adds    int; dels int; files int; labels []*github.Label
+					}{42, "pending", "dev3", "branch-c", "shaC", "main", "", false, true, 5, 2, 1, nil}),
 				}),
 				"GET /repos/owner/repo/commits/shaA/status": mockResponse(t, http.StatusOK, &github.CombinedStatus{
 					State: github.Ptr("success"),
@@ -3135,6 +3037,151 @@ func Test_BatchPRStatus(t *testing.T) {
 				assert.Equal(t, "pending", results[2].CI)
 			},
 		},
+		// --- Error path tests for full coverage ---
+		{
+			name:         "returns tool error when owner is missing",
+			mockedClient: MockHTTPClientWithHandlers(map[string]http.HandlerFunc{}),
+			requestArgs: map[string]any{
+				"repo": "repo",
+			},
+			expectError: true,
+		},
+		{
+			name:         "returns tool error when repo is missing",
+			mockedClient: MockHTTPClientWithHandlers(map[string]http.HandlerFunc{}),
+			requestArgs: map[string]any{
+				"owner": "owner",
+			},
+			expectError: true,
+		},
+		{
+			name:         "returns tool error when state has wrong type",
+			mockedClient: MockHTTPClientWithHandlers(map[string]http.HandlerFunc{}),
+			requestArgs: map[string]any{
+				"owner": "owner",
+				"repo":  "repo",
+				"state": 123,
+			},
+			expectError: true,
+		},
+		{
+			name:         "returns tool error when labels has wrong type",
+			mockedClient: MockHTTPClientWithHandlers(map[string]http.HandlerFunc{}),
+			requestArgs: map[string]any{
+				"owner":  "owner",
+				"repo":   "repo",
+				"labels": "not-an-array",
+			},
+			expectError: true,
+		},
+		{
+			name:         "returns tool error when head has wrong type",
+			mockedClient: MockHTTPClientWithHandlers(map[string]http.HandlerFunc{}),
+			requestArgs: map[string]any{
+				"owner": "owner",
+				"repo":  "repo",
+				"head":  42,
+			},
+			expectError: true,
+		},
+		{
+			name: "returns API error when pull request list fails",
+			mockedClient: MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+				GetReposPullsByOwnerByRepo: mockResponse(t, http.StatusInternalServerError, `{"message":"internal error"}`),
+			}),
+			requestArgs: map[string]any{
+				"owner": "owner",
+				"repo":  "repo",
+			},
+			expectError: true,
+		},
+		{
+			name: "returns error when GetCombinedStatus API fails",
+			mockedClient: MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+				GetReposPullsByOwnerByRepo: mockResponse(t, http.StatusOK, []*github.PullRequest{
+					makePR(struct {
+						number  int; title string; author string; headRef string; headSHA string
+						baseRef string; body string; draft bool; merge bool
+						adds    int; dels int; files int; labels []*github.Label
+					}{50, "status-fail PR", "dev", "branch-x", "shaFail", "main", "", false, true, 1, 0, 1, nil}),
+				}),
+				"GET /repos/owner/repo/commits/shaFail/status": mockResponse(t, http.StatusInternalServerError, `{"message":"status error"}`),
+			}),
+			requestArgs: map[string]any{
+				"owner": "owner",
+				"repo":  "repo",
+			},
+			expectFuncErr: true,
+		},
+		{
+			name: "returns error when ListReviews API fails",
+			mockedClient: MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+				GetReposPullsByOwnerByRepo: mockResponse(t, http.StatusOK, []*github.PullRequest{
+					makePR(struct {
+						number  int; title string; author string; headRef string; headSHA string
+						baseRef string; body string; draft bool; merge bool
+						adds    int; dels int; files int; labels []*github.Label
+					}{51, "review-fail PR", "dev", "branch-y", "shaRev", "main", "", false, true, 1, 0, 1, nil}),
+				}),
+				"GET /repos/owner/repo/commits/shaRev/status": mockResponse(t, http.StatusOK, &github.CombinedStatus{
+					State: github.Ptr("success"),
+				}),
+				"GET /repos/owner/repo/pulls/51/reviews": mockResponse(t, http.StatusInternalServerError, `{"message":"review error"}`),
+			}),
+			requestArgs: map[string]any{
+				"owner": "owner",
+				"repo":  "repo",
+			},
+			expectFuncErr: true,
+		},
+		{
+			name: "defaults state to open when not provided",
+			mockedClient: MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+				GetReposPullsByOwnerByRepo: expectQueryParams(t, map[string]string{
+					"state":    "open",
+					"per_page": "30",
+				}).andThen(mockResponse(t, http.StatusOK, []*github.PullRequest{})),
+			}),
+			requestArgs: map[string]any{
+				"owner": "owner",
+				"repo":  "repo",
+			},
+			expectError: false,
+			expectedLen: 0,
+		},
+		{
+			name: "passes head parameter to API",
+			mockedClient: MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+				GetReposPullsByOwnerByRepo: expectQueryParams(t, map[string]string{
+					"state":    "open",
+					"head":     "user:feature-branch",
+					"per_page": "30",
+				}).andThen(mockResponse(t, http.StatusOK, []*github.PullRequest{})),
+			}),
+			requestArgs: map[string]any{
+				"owner": "owner",
+				"repo":  "repo",
+				"head":  "user:feature-branch",
+			},
+			expectError: false,
+			expectedLen: 0,
+		},
+		{
+			name: "passes explicit state parameter to API",
+			mockedClient: MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+				GetReposPullsByOwnerByRepo: expectQueryParams(t, map[string]string{
+					"state":    "closed",
+					"per_page": "30",
+				}).andThen(mockResponse(t, http.StatusOK, []*github.PullRequest{})),
+			}),
+			requestArgs: map[string]any{
+				"owner": "owner",
+				"repo":  "repo",
+				"state": "closed",
+			},
+			expectError: false,
+			expectedLen: 0,
+		},
 	}
 
 	for _, tc := range tests {
@@ -3152,6 +3199,11 @@ func Test_BatchPRStatus(t *testing.T) {
 			request := createMCPRequest(tc.requestArgs)
 
 			result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+
+			if tc.expectFuncErr {
+				require.Error(t, err)
+				return
+			}
 
 			if tc.expectError {
 				require.NoError(t, err)
@@ -3174,4 +3226,254 @@ func Test_BatchPRStatus(t *testing.T) {
 			}
 		})
 	}
+}
+
+func Test_summarizeReviews(t *testing.T) {
+	t.Run("returns none with empty slice for zero reviews", func(t *testing.T) {
+		status, reviewers := summarizeReviews([]*github.PullRequestReview{})
+		assert.Equal(t, "none", status)
+		assert.Equal(t, []string{}, reviewers)
+	})
+
+	t.Run("returns approved when only APPROVED reviews exist", func(t *testing.T) {
+		status, reviewers := summarizeReviews([]*github.PullRequestReview{
+			{User: &github.User{Login: github.Ptr("alice")}, State: github.Ptr("APPROVED")},
+		})
+		assert.Equal(t, "approved", status)
+		assert.Equal(t, []string{"alice"}, reviewers)
+	})
+
+	t.Run("returns changes_requested when only CHANGES_REQUESTED reviews exist", func(t *testing.T) {
+		status, reviewers := summarizeReviews([]*github.PullRequestReview{
+			{User: &github.User{Login: github.Ptr("bob")}, State: github.Ptr("CHANGES_REQUESTED")},
+		})
+		assert.Equal(t, "changes_requested", status)
+		assert.Equal(t, []string{"bob"}, reviewers)
+	})
+
+	t.Run("returns changes_requested when mixed with approved (changes_requested takes priority)", func(t *testing.T) {
+		status, reviewers := summarizeReviews([]*github.PullRequestReview{
+			{User: &github.User{Login: github.Ptr("alice")}, State: github.Ptr("APPROVED")},
+			{User: &github.User{Login: github.Ptr("bob")}, State: github.Ptr("CHANGES_REQUESTED")},
+		})
+		assert.Equal(t, "changes_requested", status)
+		assert.ElementsMatch(t, []string{"alice", "bob"}, reviewers)
+	})
+
+	t.Run("returns pending when only COMMENTED reviews exist", func(t *testing.T) {
+		status, reviewers := summarizeReviews([]*github.PullRequestReview{
+			{User: &github.User{Login: github.Ptr("carol")}, State: github.Ptr("COMMENTED")},
+		})
+		assert.Equal(t, "pending", status)
+		assert.Equal(t, []string{"carol"}, reviewers)
+	})
+
+	t.Run("returns pending when only DISMISSED reviews exist", func(t *testing.T) {
+		status, reviewers := summarizeReviews([]*github.PullRequestReview{
+			{User: &github.User{Login: github.Ptr("dave")}, State: github.Ptr("DISMISSED")},
+		})
+		assert.Equal(t, "pending", status)
+		assert.Equal(t, []string{"dave"}, reviewers)
+	})
+
+	t.Run("returns pending when only PENDING reviews exist", func(t *testing.T) {
+		status, reviewers := summarizeReviews([]*github.PullRequestReview{
+			{User: &github.User{Login: github.Ptr("eve")}, State: github.Ptr("PENDING")},
+		})
+		assert.Equal(t, "pending", status)
+		assert.Equal(t, []string{"eve"}, reviewers)
+	})
+
+	t.Run("uses latest review state per reviewer when same user reviews multiple times", func(t *testing.T) {
+		status, reviewers := summarizeReviews([]*github.PullRequestReview{
+			{User: &github.User{Login: github.Ptr("alice")}, State: github.Ptr("CHANGES_REQUESTED")},
+			{User: &github.User{Login: github.Ptr("alice")}, State: github.Ptr("APPROVED")},
+		})
+		assert.Equal(t, "approved", status)
+		assert.Equal(t, []string{"alice"}, reviewers)
+	})
+
+	t.Run("returns none when reviews have empty user and state", func(t *testing.T) {
+		status, reviewers := summarizeReviews([]*github.PullRequestReview{
+			{User: &github.User{Login: github.Ptr("")}, State: github.Ptr("")},
+			{User: &github.User{Login: github.Ptr("")}, State: github.Ptr("APPROVED")},
+		})
+		assert.Equal(t, "none", status)
+		assert.Equal(t, []string{}, reviewers)
+	})
+
+	t.Run("returns approved with multiple approving reviewers", func(t *testing.T) {
+		status, reviewers := summarizeReviews([]*github.PullRequestReview{
+			{User: &github.User{Login: github.Ptr("alice")}, State: github.Ptr("APPROVED")},
+			{User: &github.User{Login: github.Ptr("bob")}, State: github.Ptr("APPROVED")},
+			{User: &github.User{Login: github.Ptr("carol")}, State: github.Ptr("APPROVED")},
+		})
+		assert.Equal(t, "approved", status)
+		assert.Len(t, reviewers, 3)
+		assert.ElementsMatch(t, []string{"alice", "bob", "carol"}, reviewers)
+	})
+}
+
+func Test_parseLinkedIssues(t *testing.T) {
+	t.Run("parses single Closes keyword", func(t *testing.T) {
+		issues := parseLinkedIssues("Closes #5")
+		assert.Equal(t, []int{5}, issues)
+	})
+
+	t.Run("parses single Fixes keyword", func(t *testing.T) {
+		issues := parseLinkedIssues("Fixes #10")
+		assert.Equal(t, []int{10}, issues)
+	})
+
+	t.Run("parses single Resolves keyword", func(t *testing.T) {
+		issues := parseLinkedIssues("Resolves #3")
+		assert.Equal(t, []int{3}, issues)
+	})
+
+	t.Run("parses case-insensitive keywords", func(t *testing.T) {
+		issues := parseLinkedIssues("fixes #7")
+		assert.Equal(t, []int{7}, issues)
+	})
+
+	t.Run("parses UPPERCASE keywords", func(t *testing.T) {
+		issues := parseLinkedIssues("CLOSES #42")
+		assert.Equal(t, []int{42}, issues)
+	})
+
+	t.Run("parses multiple linked issues from single body", func(t *testing.T) {
+		issues := parseLinkedIssues("Closes #5, Fixes #10, Resolves #3")
+		assert.ElementsMatch(t, []int{5, 10, 3}, issues)
+	})
+
+	t.Run("returns empty slice when no keywords match", func(t *testing.T) {
+		issues := parseLinkedIssues("No linked issues here")
+		assert.Equal(t, []int{}, issues)
+	})
+
+	t.Run("returns empty slice for empty body", func(t *testing.T) {
+		issues := parseLinkedIssues("")
+		assert.Equal(t, []int{}, issues)
+	})
+
+	t.Run("ignores bare issue references without keyword", func(t *testing.T) {
+		issues := parseLinkedIssues("Related to #42 but not closing it")
+		assert.Equal(t, []int{}, issues)
+	})
+
+	t.Run("parses issues in multiline body", func(t *testing.T) {
+		body := "This PR does stuff.\n\nCloses #1\nFixes #2\n\nAlso resolves #3"
+		issues := parseLinkedIssues(body)
+		assert.ElementsMatch(t, []int{1, 2, 3}, issues)
+	})
+}
+
+func Test_filterPRsByLabels(t *testing.T) {
+	makeLabeledPR := func(number int, labelNames ...string) *github.PullRequest {
+		labels := make([]*github.Label, len(labelNames))
+		for i, name := range labelNames {
+			labels[i] = &github.Label{Name: github.Ptr(name)}
+		}
+		return &github.PullRequest{
+			Number: github.Ptr(number),
+			Labels: labels,
+		}
+	}
+
+	t.Run("returns all PRs when labels list is empty", func(t *testing.T) {
+		prs := []*github.PullRequest{
+			makeLabeledPR(1, "bug"),
+			makeLabeledPR(2, "feature"),
+		}
+		// filterPRsByLabels is only called when len(labels) > 0 in BatchPRStatus,
+		// but the function itself still works with empty labels (returns nothing since no match).
+		result := filterPRsByLabels(prs, []string{})
+		assert.Empty(t, result)
+	})
+
+	t.Run("includes PR when it has a matching label", func(t *testing.T) {
+		prs := []*github.PullRequest{
+			makeLabeledPR(1, "bug"),
+			makeLabeledPR(2, "feature"),
+		}
+		result := filterPRsByLabels(prs, []string{"bug"})
+		require.Len(t, result, 1)
+		assert.Equal(t, 1, result[0].GetNumber())
+	})
+
+	t.Run("excludes PR when it has no matching label", func(t *testing.T) {
+		prs := []*github.PullRequest{
+			makeLabeledPR(1, "feature"),
+		}
+		result := filterPRsByLabels(prs, []string{"bug"})
+		assert.Empty(t, result)
+	})
+
+	t.Run("includes PR when one of its multiple labels matches", func(t *testing.T) {
+		prs := []*github.PullRequest{
+			makeLabeledPR(1, "bug", "priority-high"),
+		}
+		result := filterPRsByLabels(prs, []string{"priority-high"})
+		require.Len(t, result, 1)
+		assert.Equal(t, 1, result[0].GetNumber())
+	})
+
+	t.Run("matches labels case-insensitively", func(t *testing.T) {
+		prs := []*github.PullRequest{
+			makeLabeledPR(1, "Bug"),
+		}
+		result := filterPRsByLabels(prs, []string{"bug"})
+		require.Len(t, result, 1)
+		assert.Equal(t, 1, result[0].GetNumber())
+	})
+
+	t.Run("includes PR when any of multiple filter labels match", func(t *testing.T) {
+		prs := []*github.PullRequest{
+			makeLabeledPR(1, "feature"),
+			makeLabeledPR(2, "bug"),
+			makeLabeledPR(3, "docs"),
+		}
+		result := filterPRsByLabels(prs, []string{"bug", "docs"})
+		require.Len(t, result, 2)
+		assert.Equal(t, 2, result[0].GetNumber())
+		assert.Equal(t, 3, result[1].GetNumber())
+	})
+
+	t.Run("returns empty when no PRs have matching labels", func(t *testing.T) {
+		prs := []*github.PullRequest{
+			makeLabeledPR(1, "feature"),
+			makeLabeledPR(2, "enhancement"),
+		}
+		result := filterPRsByLabels(prs, []string{"bug"})
+		assert.Empty(t, result)
+	})
+}
+
+func Test_prHasAnyLabel(t *testing.T) {
+	t.Run("returns true when PR has a label in the set", func(t *testing.T) {
+		pr := &github.PullRequest{
+			Labels: []*github.Label{{Name: github.Ptr("bug")}},
+		}
+		assert.True(t, prHasAnyLabel(pr, map[string]bool{"bug": true}))
+	})
+
+	t.Run("returns false when PR has no labels in the set", func(t *testing.T) {
+		pr := &github.PullRequest{
+			Labels: []*github.Label{{Name: github.Ptr("feature")}},
+		}
+		assert.False(t, prHasAnyLabel(pr, map[string]bool{"bug": true}))
+	})
+
+	t.Run("returns false when PR has no labels", func(t *testing.T) {
+		pr := &github.PullRequest{
+			Labels: []*github.Label{},
+		}
+		assert.False(t, prHasAnyLabel(pr, map[string]bool{"bug": true}))
+	})
+
+	t.Run("matches case-insensitively", func(t *testing.T) {
+		pr := &github.PullRequest{
+			Labels: []*github.Label{{Name: github.Ptr("BUG")}},
+		}
+		assert.True(t, prHasAnyLabel(pr, map[string]bool{"bug": true}))
+	})
 }
